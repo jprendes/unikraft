@@ -12,6 +12,12 @@
 #include <hyperlight-x86/outb.h>
 #include <hyperlight-x86/dispatch.h>
 
+#ifdef CONFIG_HYPERLIGHT_HCALL
+#include <uk/lcpu.h>
+#include <uk/plat/time.h>
+#include <uk/plat/common/_time.h>
+#endif
+
 /* Push void result to the output buffer before halting.
  * This is needed because the application exits via uk_pm_shutdown,
  * bypassing the dispatch stub's output buffer push.
@@ -45,16 +51,36 @@ static int hyperlight_crash(void)
 	__builtin_unreachable();
 }
 
+#ifdef CONFIG_HYPERLIGHT_HCALL
+static void hyperlight_halt_irq(void)
+{
+	time_block_until((__snsec)ukplat_monotonic_clock() + 1000000000LL);
+}
+#endif
+
 static const struct uk_pm_ops hyperlight_pm_ops = {
 	.syshalt = hyperlight_halt,
 	.sysrestart = hyperlight_halt,
 	.syscrash = hyperlight_crash,
 };
 
+#ifdef CONFIG_HYPERLIGHT_HCALL
+static const struct uk_lcpu_pm_ops hyperlight_lcpu_pm_ops = {
+	.halt_irq = hyperlight_halt_irq,
+};
+#endif
+
 int hyperlight_register_pm_ops(struct ukplat_bootinfo __unused *bi)
 {
 	int rc = uk_pm_ops_register(&hyperlight_pm_ops);
 	return rc;
 }
+
+#ifdef CONFIG_HYPERLIGHT_HCALL
+void hyperlight_register_lcpu_pm_ops(void)
+{
+	uk_lcpu_pm_ops_register(&hyperlight_lcpu_pm_ops);
+}
+#endif
 
 UK_BOOT_EARLYTAB_ENTRY(hyperlight_register_pm_ops, UK_PRIO_EARLIEST);

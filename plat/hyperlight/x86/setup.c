@@ -491,7 +491,14 @@ void _ukplat_entry(struct ukplat_bootinfo *bi)
 
 	uk_boot_early_init(bi);
 
-
+	/* Re-register LCPU PM ops after early init so that Hyperlight's
+	 * halt_irq (which polls sockets via __hl_sleep) is not overwritten
+	 * by the native platform's HLT-based halt_irq.
+	 */
+	{
+		extern void hyperlight_register_lcpu_pm_ops(void);
+		hyperlight_register_lcpu_pm_ops();
+	}
 
 	/* Initialize IRQ controller */
 	rc = uk_intctlr_probe();
