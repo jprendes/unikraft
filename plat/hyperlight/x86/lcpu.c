@@ -8,8 +8,6 @@
 #include <uk/arch/ctx.h>
 #include <uk/assert.h>
 #include <uk/lcpu.h>
-#include <uk/lcpu.h>
-
 
 void uk_lcpu_enable_irq(void)
 {
@@ -18,23 +16,6 @@ void uk_lcpu_enable_irq(void)
 
 void uk_lcpu_disable_irq(void)
 {
-	local_irq_disable();
-}
-
-void uk_lcpu_halt_irq(void)
-{
-	UK_ASSERT(uk_lcpu_irqs_disabled());
-
-	/*
-	 * We have to be careful when enabling interrupts before entering a
-	 * halt state. If we want to wait for an interrupt (e.g., a timer)
-	 * the interrupt may fire in the short window between sti and hlt and
-	 * we are going to halt forever. As sti only enables interrupts after
-	 * the following instruction, we can avoid the race condition by
-	 * ensuring that hlt immediately follows sti. There must be no
-	 * instruction in between.
-	 */
-	local_irq_enable_halt();
 	local_irq_disable();
 }
 
