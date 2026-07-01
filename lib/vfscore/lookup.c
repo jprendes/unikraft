@@ -42,6 +42,8 @@
 #include <vfscore/vnode.h>
 #include "vfs.h"
 
+extern int vfs_vfork_active;
+
 static ssize_t
 read_link(struct vnode *vp, char *buf, size_t bufsz, ssize_t *sz)
 {
@@ -192,6 +194,33 @@ namei_resolve(const char *path, struct dentry **dpp, char *realpath)
 			 */
 			strlcat(node, "/", sizeof(node));
 			strlcat(node, name, sizeof(node));
+			if (ddp == mp->m_root && vfs_vfork_active) {
+				struct vnode tmp_vn;
+
+				dp = dentry_lookup(mp, node);
+				if (dp == NULL) {
+					memset(&tmp_vn, 0, sizeof(tmp_vn));
+					tmp_vn.v_op = mp->m_op->vfs_vnops;
+					tmp_vn.v_mount = mp;
+					uk_mutex_init(&tmp_vn.v_lock);
+					UK_INIT_LIST_HEAD(&tmp_vn.v_names);
+					tmp_vn.v_data = mp->m_data;
+					error = VOP_LOOKUP(&tmp_vn, name,
+							   &vp);
+					if (error) {
+						drele(ddp);
+						goto out;
+					}
+					dp = dentry_alloc(ddp, vp, node);
+					vput(vp);
+					if (!dp) {
+						drele(ddp);
+						error = ENOMEM;
+						goto out;
+					}
+				}
+				drele(ddp);
+			} else {
 			dvp = ddp->d_vnode;
 			vn_lock(dvp);
 			dp = dentry_lookup(mp, node);
@@ -216,6 +245,7 @@ namei_resolve(const char *path, struct dentry **dpp, char *realpath)
 			}
 			vn_unlock(dvp);
 			drele(ddp);
+			}
 			ddp = dp;
 
 			if (dp->d_vnode->v_type == VLNK) {
