@@ -58,3 +58,9 @@ tgkill
 signalfd
 uk_posix_process_create_pthread
 uk_posix_process_run
+hyperlight_init_pthread
+hyperlight_init_pthread_self_addr
+hyperlight_init_pprocess
+hyperlight_vfork_parent_thread
+hyperlight_parent_pthread_self_addr
+vfs_vfork_active
