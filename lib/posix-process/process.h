@@ -103,6 +103,15 @@ extern struct posix_process *pid_process[TIDMAP_SIZE];
 
 extern __uk_tls struct posix_thread *pthread_self;
 
+#if CONFIG_PLAT_HYPERLIGHT
+extern struct posix_thread *hyperlight_init_pthread;
+extern struct uk_thread *hyperlight_vfork_parent_thread;
+extern struct posix_process *hyperlight_init_pprocess;
+extern volatile unsigned long *hyperlight_parent_pthread_self_addr;
+extern __u64 hyperlight_user_stack_top;
+extern int vfs_vfork_active;
+#endif
+
 #define uk_pprocess_foreach(_p)						\
 	for (int _j = 1, _i = 0; _i != ARRAY_SIZE(pid_process);		\
 		_j = !_j, _i++)						\
@@ -120,8 +129,23 @@ extern __uk_tls struct posix_thread *pthread_self;
 #define uk_pthread_current()						\
 	uk_thread_uktls_var(uk_thread_current(), pthread_self)
 
+#if CONFIG_PLAT_HYPERLIGHT
+static inline struct posix_process *__uk_pprocess_current(void)
+{
+	struct posix_thread *pt = uk_pthread_current();
+	if (pt && pt->process)
+		return pt->process;
+	if (hyperlight_init_pthread && hyperlight_init_pthread->process)
+		return hyperlight_init_pthread->process;
+	if (hyperlight_init_pprocess)
+		return hyperlight_init_pprocess;
+	return __NULL;
+}
+#define uk_pprocess_current() __uk_pprocess_current()
+#else
 #define uk_pprocess_current()						\
 	uk_pthread_current()->process
+#endif
 
 struct posix_process *pid2pprocess(pid_t pid);
 struct uk_thread *tid2ukthread(pid_t tid);
