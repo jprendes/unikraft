@@ -14,6 +14,7 @@
 #if !__ASSEMBLY__
 
 void clone_setup_child_ctx(struct ukarch_execenv *pexecenv,
-			   struct uk_thread *child, __uptr sp);
+			   struct uk_thread *child, __uptr sp,
+			   int is_vfork);
 
 #endif /* !__ASSEMBLY__ */

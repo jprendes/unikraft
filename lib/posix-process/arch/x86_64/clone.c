@@ -10,7 +10,8 @@
 #include <uk/lcpu.h>
 
 void clone_setup_child_ctx(struct ukarch_execenv *pexecenv,
-			   struct uk_thread *child, __uptr sp)
+			   struct uk_thread *child, __uptr sp,
+			   int is_vfork)
 {
 	struct ukarch_execenv *cexecenv;
 	struct ukarch_auxspcb *auxspcb;
@@ -50,8 +51,14 @@ void clone_setup_child_ctx(struct ukarch_execenv *pexecenv,
 	gsbase = uk_lcpu_sysctx_get(pexecenv->sysctx, GSBASE);
 	uk_lcpu_sysctx_set(cexecenv->sysctx, GSBASE, gsbase);
 
-	/* Use parent's fsbase if clone did not have SETTLS */
-	if (!child->tlsp)
+	/* For vfork the child shares the parent's stack whose frames
+	 * carry stack-canary values derived from the parent's user-TLS
+	 * (%fs:0x28 on x86-64).  The child has its own kernel TLS
+	 * (child->uktlsp) for __thread variables, but the execenv
+	 * FSBASE — which is restored on return to userspace — must be
+	 * the parent's so the canary check passes.
+	 */
+	if (is_vfork || !child->tlsp)
 		fsbase = uk_lcpu_sysctx_get(pexecenv->sysctx, FSBASE);
 	else
 		fsbase = child->tlsp;
