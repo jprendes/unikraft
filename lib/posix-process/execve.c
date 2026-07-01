@@ -51,15 +51,19 @@ static void __noreturn execve_ctx_switch(long arg0, long arg1)
 	/* If we're coming from VFORK it's time to wake up the parent.
 	 * Otherwise, free the old stack.
 	 */
+#if CONFIG_PLAT_HYPERLIGHT
+	if (hyperlight_vfork_parent_thread) {
+		uk_thread_wake(hyperlight_vfork_parent_thread);
+		hyperlight_vfork_parent_thread = NULL;
+	} else
+#endif
 	if (pthread_parent->state == POSIX_THREAD_BLOCKED_VFORK) {
-		uk_pr_debug("Waking up parent (tid %d)\n", pthread_parent->tid);
 		uk_thread_wake(tid2ukthread(pthread_parent->tid));
 		pthread_parent->state = POSIX_THREAD_RUNNING;
 	} else {
 		uk_free(this_thread->_mem.stack_a, stack_old);
 	}
 
-	uk_pr_debug("Switching context\n");
 switch_ctx:
 	ukarch_execenv_load((long)execenv_new);
 }
@@ -104,30 +108,57 @@ UK_SYSCALL_R_E_DEFINE(int, execve, const char *, pathname,
 	this_thread = uk_thread_current();
 	UK_ASSERT(this_thread);
 
-	loader_args.argv = (const char **)argv;
-	loader_args.envp = (const char **)envp;
-	loader_args.pathname = (char *)pathname;
 	loader_args.loader = NULL;
 	loader_args.user = NULL;
 
-	/* Assume that if argv is set the caller follows the convention */
-	loader_args.progname = (argv && argv[0]) ? argv[0] : "<null>";
-
-	/* Assign the default allocator to the loader. This will be used
-	 * to allocate memory for the executable image.
+	/* Deep-copy pathname, argv, and envp to kernel heap.
+	 * ELF loading maps the new binary into the same address space,
+	 * which can overwrite the userspace memory where these live.
 	 */
+	{
+		struct uk_alloc *a = uk_alloc_get_default();
+		int i, argc_n = 0, envc_n = 0;
+
+		loader_args.pathname = strdup(pathname);
+		if (!loader_args.pathname)
+			return -ENOMEM;
+
+		if (argv)
+			for (i = 0; argv[i]; i++)
+				argc_n++;
+		loader_args.argv = uk_calloc(a, argc_n + 1,
+					     sizeof(const char *));
+		if (!loader_args.argv) {
+			free((void *)loader_args.pathname);
+			return -ENOMEM;
+		}
+		for (i = 0; i < argc_n; i++)
+			loader_args.argv[i] = strdup(argv[i]);
+
+		if (envp)
+			for (i = 0; envp[i]; i++)
+				envc_n++;
+		loader_args.envp = uk_calloc(a, envc_n + 1,
+					     sizeof(const char *));
+		if (!loader_args.envp) {
+			free((void *)loader_args.pathname);
+			uk_free(a, loader_args.argv);
+			return -ENOMEM;
+		}
+		for (i = 0; i < envc_n; i++)
+			loader_args.envp[i] = strdup(envp[i]);
+	}
+
+	loader_args.progname = (loader_args.argv && loader_args.argv[0])
+				? loader_args.argv[0] : "<null>";
+
 	loader_args.alloc = uk_alloc_get_default();
 
-	/* Allocate a new stack. Even if we don't come from vfork we
-	 * can't operate on the current thread's stack without either
-	 * corrupting it or wasting space. Use the threads's
-	 * stack allocator for the new stack.
-	 */
+	if (!this_thread->_mem.stack_a)
+		this_thread->_mem.stack_a = uk_alloc_get_default();
 	stack_new = uk_malloc(this_thread->_mem.stack_a, STACK_SIZE);
-	if (unlikely(!stack_new)) {
-		uk_pr_err("Could not allocate stack\n");
+	if (unlikely(!stack_new))
 		return -ENOMEM;
-	}
 
 	loader_args.stack_size = STACK_SIZE;
 	loader_args.ctx.sp = ukarch_gen_sp((__uptr)stack_new,
@@ -153,20 +184,13 @@ UK_SYSCALL_R_E_DEFINE(int, execve, const char *, pathname,
 
 	/* Load executable */
 	rc = uk_binfmt_load(&loader_args);
-	if (unlikely(rc)) {
-		uk_pr_err("%s: Unable to load (%d)\n", pathname, rc);
+	if (unlikely(rc))
 		goto err_free_stack_new;
-	}
 
-	/* Do arch-specific context (execenv) initialization */
 	execve_arch_execenv_init(execenv_new, execenv,
 				 loader_args.ctx.ip,
 				 loader_args.ctx.sp);
 
-	/* Prepare process for executing new context. First notify posix
-	 * libraries that may have registered for the event, then do the
-	 * internal cleanup.
-	 */
 	event_data = (struct posix_process_execve_event_data) {
 		.thread = this_thread,
 		.tid = ukthread2tid(this_thread),
