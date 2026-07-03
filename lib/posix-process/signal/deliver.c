@@ -9,6 +9,7 @@
 #include <uk/plat/config.h>
 #include <uk/prio.h>
 #include <uk/process.h>
+#include <uk/sched.h>
 #include <uk/syscall.h>
 
 #include "process.h"
@@ -84,6 +85,12 @@ bool pprocess_signal_is_deliverable(struct posix_thread *pthread, int signum)
 	UK_ASSERT(signum);
 
 	proc = tid2pprocess(pthread->tid);
+#if CONFIG_PLAT_HYPERLIGHT
+	if (!proc)
+		proc = uk_pprocess_current();
+	if (!proc)
+		return 0;
+#endif
 	UK_ASSERT(proc);
 
 	return (!IS_MASKED(pthread, signum) && !IS_IGNORED(proc, signum));
@@ -302,6 +309,10 @@ static int deliver_pending_thread(struct posix_thread *thread,
 	int signum;
 
 	proc = tid2pprocess(thread->tid);
+#if CONFIG_PLAT_HYPERLIGHT
+	if (!proc)
+		return 0;
+#endif
 	UK_ASSERT(proc);
 
 	/* Deliver this thread's signals. SUS requires that RT signals
@@ -333,6 +344,8 @@ static void uk_signal_deliver(struct uk_syscall_exit_ctx *exit_ctx)
 
 	execenv = exit_ctx->execenv;
 
+
+
 	/* FIXME: This can go away once we eliminate the last syscall made
 	 *        by kernel context and pass execenv to syscalls in native
 	 *        mode.
@@ -341,10 +354,28 @@ static void uk_signal_deliver(struct uk_syscall_exit_ctx *exit_ctx)
 		return;
 
 	pthread = uk_pthread_current();
-	UK_ASSERT(pthread);
+	if (!pthread)
+		return;
 
-	pproc = uk_pprocess_current();
-	UK_ASSERT(pproc);
+	pproc = pthread->process;
+	if (!pproc)
+		return;
+
+	if (!pproc->signal)
+		return;
+
+#if CONFIG_PLAT_HYPERLIGHT
+	{
+		extern int vfs_vfork_active;
+		extern int hyperlight_skip_sigdeliver;
+		if (vfs_vfork_active)
+			hyperlight_skip_sigdeliver = 8;
+		if (hyperlight_skip_sigdeliver > 0) {
+			hyperlight_skip_sigdeliver--;
+			return;
+		}
+	}
+#endif
 
 	/* If there's SIGKILL pending, kill the process right away */
 	if (IS_PENDING(pproc->signal->sigqueue, SIGKILL)) {
@@ -357,8 +388,11 @@ static void uk_signal_deliver(struct uk_syscall_exit_ctx *exit_ctx)
 	}
 
 	/* SIGSTOP / SIGCONT should have been already ignored by rt_sigaction */
-	UK_ASSERT(!IS_PENDING(pproc->signal->sigqueue, SIGSTOP));
-	UK_ASSERT(!IS_PENDING(pproc->signal->sigqueue, SIGCONT));
+	if (IS_PENDING(pproc->signal->sigqueue, SIGSTOP) ||
+	    IS_PENDING(pproc->signal->sigqueue, SIGCONT)) {
+		uk_pr_crit("[sig-deliver] unexpected SIGSTOP/SIGCONT, skipping\n");
+		return;
+	}
 
 	/* Deliver all pending signals of this process & thread */
 	deliver_pending_proc(pproc, execenv);
@@ -393,10 +427,34 @@ void sys_error_handler(struct ukarch_execenv *ee __unused, long arg)
 
 	/* Derive current process and thread */
 	pproc = uk_pprocess_current();
-	UK_ASSERT(pproc);
+	if (!pproc) {
+#if CONFIG_PLAT_HYPERLIGHT
+		uk_pr_crit("[sig-exit] pproc=NULL sig=%d vaddr=0x%lx rip=0x%lx — thread exiting\n",
+			   error->signum, (unsigned long)error->vaddr,
+			   (unsigned long)uk_lcpu_regs_get(ee->regs, PC));
+		uk_lcpu_disable_irq();
+		for (;;)
+			uk_sched_yield();
+#else
+		UK_CRASH("[SYS-ERROR] pproc is NULL for sig=%d vaddr=0x%lx\n",
+			 error->signum, (unsigned long)error->vaddr);
+#endif
+	}
 
 	pthread = uk_pthread_current();
-	UK_ASSERT(pthread);
+	if (!pthread) {
+#if CONFIG_PLAT_HYPERLIGHT
+		uk_pr_crit("[sig-exit] pthread=NULL sig=%d vaddr=0x%lx rip=0x%lx — thread exiting\n",
+			   error->signum, (unsigned long)error->vaddr,
+			   (unsigned long)uk_lcpu_regs_get(ee->regs, PC));
+		uk_lcpu_disable_irq();
+		for (;;)
+			uk_sched_yield();
+#else
+		UK_CRASH("[SYS-ERROR] pthread is NULL for sig=%d vaddr=0x%lx\n",
+			 error->signum, (unsigned long)error->vaddr);
+#endif
+	}
 
 	/* If there's a SIGKILL pending, kill the process right away */
 	if (IS_PENDING(pproc->signal->sigqueue, SIGKILL)) {

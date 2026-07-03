@@ -15,6 +15,7 @@
 #include <uk/syscall.h>
 
 #include <uk/posix-fdtab.h>
+#include <uk/print.h>
 
 #include "fmap.h"
 
@@ -454,8 +455,9 @@ static struct uk_fdtab *fdtab_duplicate(struct uk_fdtab *tab)
 		struct fdval v = _fdtab_get(tab, i);
 		const void *entry = NULL;
 
-		if (v.p)
+		if (v.p) {
 			entry = fdtab_encode(v.p, v.flags);
+		}
 		uk_fmap_set(&ret->fmap, i, entry);
 	}
 	return ret;
@@ -519,11 +521,6 @@ static int fdtab_clone(void *arg)
 
 	if (cl_args->flags & CLONE_FILES) {
 		/* Inherit parent's fdtab */
-		/* As a compat stop-gap, the raw thread already inherited the
-		 * parent's fdtab ref; we don't need to do anything.
-		 *
-		 * TODO: move inheritance here once stopgap is removed.
-		 */
 		UK_ASSERT(uk_thread_uktls_var(child, active_fdtab) == tab);
 		return UK_EVENT_HANDLED_CONT;
 	} else {
@@ -647,6 +644,24 @@ int uk_sys_dup(int oldfd)
 UK_SYSCALL_R_DEFINE(int, close, int, fd)
 {
 	return uk_sys_close(fd);
+}
+
+UK_SYSCALL_R_DEFINE(int, close_range, int, first, int, last, int, flags)
+{
+	int fd;
+	int end;
+
+	if (flags != 0)
+		return -EINVAL;
+
+	end = last;
+	if (end >= UK_FDTAB_SIZE)
+		end = UK_FDTAB_SIZE - 1;
+
+	for (fd = first; fd <= end && fd >= 0; fd++)
+		uk_sys_close(fd);
+
+	return 0;
 }
 
 UK_SYSCALL_R_DEFINE(int, dup, int, oldfd)

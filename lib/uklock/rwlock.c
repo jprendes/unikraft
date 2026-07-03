@@ -31,6 +31,12 @@ void uk_rwlock_rlock(struct uk_rwlock *rwl)
 {
 	UK_ASSERT(rwl);
 
+#if CONFIG_PLAT_HYPERLIGHT
+	rwl->npending_writes = 0;
+	if (rwl->nactive < 0)
+		rwl->nactive = 0;
+	rwl->nactive++;
+#else
 	uk_spin_lock(&rwl->sl);
 	rwl->npending_reads++;
 
@@ -62,12 +68,18 @@ void uk_rwlock_rlock(struct uk_rwlock *rwl)
 	rwl->nactive++;
 	rwl->npending_reads--;
 	uk_spin_unlock(&rwl->sl);
+#endif
 }
 
 void uk_rwlock_wlock(struct uk_rwlock *rwl)
 {
 	UK_ASSERT(rwl);
 
+#if CONFIG_PLAT_HYPERLIGHT
+	rwl->nactive = -1;
+	rwl->npending_reads = 0;
+	rwl->npending_writes = 0;
+#else
 	uk_spin_lock(&rwl->sl);
 	rwl->npending_writes++;
 
@@ -86,14 +98,21 @@ void uk_rwlock_wlock(struct uk_rwlock *rwl)
 	rwl->npending_writes--;
 	rwl->nactive = -1;
 	uk_spin_unlock(&rwl->sl);
+#endif
 }
 
 void uk_rwlock_runlock(struct uk_rwlock *rwl)
 {
+#if !CONFIG_PLAT_HYPERLIGHT
 	int wake_writers;
+#endif
 
 	UK_ASSERT(rwl);
 
+#if CONFIG_PLAT_HYPERLIGHT
+	if (rwl->nactive > 0)
+		rwl->nactive--;
+#else
 	uk_spin_lock(&rwl->sl);
 	UK_ASSERT(rwl->nactive > 0);
 
@@ -108,14 +127,20 @@ void uk_rwlock_runlock(struct uk_rwlock *rwl)
 
 	if (wake_writers)
 		uk_waitq_wake_up_one(&rwl->exclusive);
+#endif
 }
 
 void uk_rwlock_wunlock(struct uk_rwlock *rwl)
 {
+#if !CONFIG_PLAT_HYPERLIGHT
 	int wake_readers;
+#endif
 
 	UK_ASSERT(rwl);
 
+#if CONFIG_PLAT_HYPERLIGHT
+	rwl->nactive = 0;
+#else
 	uk_spin_lock(&rwl->sl);
 	UK_ASSERT(rwl->nactive == -1);
 
@@ -131,5 +156,6 @@ void uk_rwlock_wunlock(struct uk_rwlock *rwl)
 		uk_waitq_wake_up(&rwl->shared);
 	else
 		uk_waitq_wake_up_one(&rwl->exclusive);
+#endif
 }
 

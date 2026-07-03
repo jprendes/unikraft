@@ -70,6 +70,52 @@
 	popq_reg_cfi rdi
 .endm
 
+/* Save XMM0-XMM15 below the struct on the stack. The CoW page-fault
+ * handler calls memcpy which uses SSE and clobbers XMM registers.
+ * Interrupted code (e.g. libpython's GC_Track) may hold live values
+ * in XMM across a memory access that triggers a CoW fault. */
+.macro XMM_SAVE
+	subq  $256, %rsp
+	.cfi_adjust_cfa_offset 256
+	movups %xmm0,  0x00(%rsp)
+	movups %xmm1,  0x10(%rsp)
+	movups %xmm2,  0x20(%rsp)
+	movups %xmm3,  0x30(%rsp)
+	movups %xmm4,  0x40(%rsp)
+	movups %xmm5,  0x50(%rsp)
+	movups %xmm6,  0x60(%rsp)
+	movups %xmm7,  0x70(%rsp)
+	movups %xmm8,  0x80(%rsp)
+	movups %xmm9,  0x90(%rsp)
+	movups %xmm10, 0xa0(%rsp)
+	movups %xmm11, 0xb0(%rsp)
+	movups %xmm12, 0xc0(%rsp)
+	movups %xmm13, 0xd0(%rsp)
+	movups %xmm14, 0xe0(%rsp)
+	movups %xmm15, 0xf0(%rsp)
+.endm
+
+.macro XMM_RESTORE
+	movups 0x00(%rsp), %xmm0
+	movups 0x10(%rsp), %xmm1
+	movups 0x20(%rsp), %xmm2
+	movups 0x30(%rsp), %xmm3
+	movups 0x40(%rsp), %xmm4
+	movups 0x50(%rsp), %xmm5
+	movups 0x60(%rsp), %xmm6
+	movups 0x70(%rsp), %xmm7
+	movups 0x80(%rsp), %xmm8
+	movups 0x90(%rsp), %xmm9
+	movups 0xa0(%rsp), %xmm10
+	movups 0xb0(%rsp), %xmm11
+	movups 0xc0(%rsp), %xmm12
+	movups 0xd0(%rsp), %xmm13
+	movups 0xe0(%rsp), %xmm14
+	movups 0xf0(%rsp), %xmm15
+	addq  $256, %rsp
+	.cfi_adjust_cfa_offset -256
+.endm
+
 .macro TRAP_ENTRY trapname, trapnr, has_ec
 ENTRY(ASM_TRAP_SYM(\trapname))
 	.cfi_startproc simple
@@ -106,10 +152,15 @@ ENTRY(ASM_TRAP_SYM(\trapname))
 	subq $UK_LCPU_X86_64_REGS_OFFSETOF_R15, %rsp
 	.cfi_adjust_cfa_offset UK_LCPU_X86_64_REGS_OFFSETOF_R15
 
+	/* Save XMM registers below the struct frame */
+	XMM_SAVE
+
 	movq $\trapnr, %rdi
-	movq %rsp, %rsi
-	movq UK_LCPU_X86_64_REGS_OFFSETOF_ORIG_RAX(%rsp), %rdx
+	leaq 256(%rsp), %rsi
+	movq (UK_LCPU_X86_64_REGS_OFFSETOF_ORIG_RAX + 256)(%rsp), %rdx
 	call uk_plat_native_except_err_handler
+
+	XMM_RESTORE
 
 	/* we have some padding */
 	addq $UK_LCPU_X86_64_REGS_OFFSETOF_R15, %rsp
@@ -150,9 +201,14 @@ ENTRY(cpu_irq_\irqno)
 	subq $UK_LCPU_X86_64_REGS_OFFSETOF_R15, %rsp
 	.cfi_adjust_cfa_offset UK_LCPU_X86_64_REGS_OFFSETOF_R15
 
-	movq %rsp, %rdi
+	/* Save XMM registers below the struct frame */
+	XMM_SAVE
+
+	leaq 256(%rsp), %rdi
 	movq $\irqno, %rsi
 	call uk_plat_native_except_irq_handler
+
+	XMM_RESTORE
 
 	/* we have some padding */
 	addq $UK_LCPU_X86_64_REGS_OFFSETOF_R15, %rsp

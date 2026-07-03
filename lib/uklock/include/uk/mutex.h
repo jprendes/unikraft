@@ -169,12 +169,23 @@ static inline void uk_mutex_lock(struct uk_mutex *m)
 	v = _UK_MUTEX_UNOWNED;
 	tid = (__uptr)uk_thread_current();
 
+#if CONFIG_PLAT_HYPERLIGHT
+	if (_uk_mutex_lock_fetch(m, &v, tid)) {
+		m->lock_count = 1;
+	} else if (tid == (v & ~_UK_MUTEX_STATE_MASK)) {
+		m->lock_count++;
+	} else {
+		__atomic_store_n(&m->lock, tid, __ATOMIC_RELEASE);
+		m->lock_count = 1;
+	}
+#else
 	if (_uk_mutex_lock_fetch(m, &v, tid)) {
 		UK_ASSERT(m->lock_count == 0);
 		m->lock_count = 1;
 	} else {
 		_uk_mutex_lock_wait(m, tid, v);
 	}
+#endif
 
 #ifdef CONFIG_LIBUKLOCK_MUTEX_METRICS
 	ukarch_spin_lock(&_uk_mutex_metrics_lock);
@@ -195,6 +206,17 @@ static inline int uk_mutex_trylock(struct uk_mutex *m)
 	v = _UK_MUTEX_UNOWNED;
 	tid = (__uptr)uk_thread_current();
 
+#if CONFIG_PLAT_HYPERLIGHT
+	if (_uk_mutex_lock_fetch(m, &v, tid)) {
+		m->lock_count = 1;
+	} else if (tid == (v & ~_UK_MUTEX_STATE_MASK)) {
+		m->lock_count++;
+	} else {
+		__atomic_store_n(&m->lock, tid, __ATOMIC_RELEASE);
+		m->lock_count = 1;
+	}
+	return 1;
+#else
 	if (_uk_mutex_lock_fetch(m, &v, tid)) {
 		UK_ASSERT(m->lock_count == 0);
 		m->lock_count = 1;
@@ -209,6 +231,7 @@ static inline int uk_mutex_trylock(struct uk_mutex *m)
 		return 1;
 	}
 	return _uk_mutex_trylock_wait(m, tid, v);
+#endif
 }
 
 static inline int uk_mutex_is_locked(struct uk_mutex *m)
@@ -230,9 +253,18 @@ static inline void uk_mutex_unlock(struct uk_mutex *m)
 	v = (__uptr)uk_thread_current();
 
 	UK_ASSERT(m);
+#if CONFIG_PLAT_HYPERLIGHT
+	if (m->lock_count <= 0) {
+		m->lock_count = 0;
+		__atomic_store_n(&m->lock, _UK_MUTEX_UNOWNED,
+				 __ATOMIC_RELEASE);
+		return;
+	}
+#else
 	UK_ASSERT(m->lock_count > 0);
 	UK_ASSERT((m->lock & ~_UK_MUTEX_STATE_MASK) ==
 		  (v & ~_UK_MUTEX_STATE_MASK));
+#endif
 
 	if (--m->lock_count == 0) {
 		/* Make sure lock_count is visible before resetting the

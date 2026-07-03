@@ -59,6 +59,7 @@ struct posix_thread *hyperlight_init_pthread;
 struct posix_process *hyperlight_init_pprocess;
 struct uk_thread *hyperlight_vfork_parent_thread;
 __attribute__((used)) int vfs_vfork_active;
+int hyperlight_skip_sigdeliver;
 volatile unsigned long *hyperlight_parent_pthread_self_addr;
 __uptr hyperlight_init_pthread_self_addr;
 #endif
@@ -210,8 +211,8 @@ void pprocess_release_pthread(struct posix_thread *pthread)
 	release_tid(pthread->tid);
 	tid_thread[pthread->tid] = NULL;
 
-	/* release memory */
-	uk_free(pthread->_a, pthread);
+	if (pthread->thread != uk_thread_current())
+		uk_free(pthread->_a, pthread);
 }
 
 int uk_posix_process_create_pthread(struct uk_thread *thread)

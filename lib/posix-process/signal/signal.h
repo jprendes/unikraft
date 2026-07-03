@@ -81,12 +81,25 @@
 /* Helper to get pointer to kern_sigaction from process,
  * for a given signal
  */
+#if CONFIG_PLAT_HYPERLIGHT
+#define KERN_SIGACTION(_proc, _signum)					\
+	({								\
+		static struct kern_sigaction _hl_default_ks;		\
+		struct kern_sigaction *_ks;				\
+		if ((_proc)->signal && (_proc)->signal->sigaction)	\
+			_ks = &(_proc)->signal->sigaction->ks[_signum];	\
+		else							\
+			_ks = &_hl_default_ks;				\
+		_ks;							\
+	})
+#else
 #define KERN_SIGACTION(_proc, _signum)					\
 	({								\
 		UK_ASSERT((_proc)->signal);				\
 		UK_ASSERT((_proc)->signal->sigaction);			\
 		&(_proc)->signal->sigaction->ks[_signum];		\
 	})
+#endif
 
 /* Helper to iterate over all signals (std + rt) */
 #define pprocess_signal_foreach(_sn)					\

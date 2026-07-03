@@ -125,6 +125,8 @@ static ssize_t signal_file_read(const struct uk_file *f,
 	struct uk_signal *sig;
 	__sz sn;
 
+	if (!f)
+		return -EBADF;
 	if (unlikely(off))
 		return -EINVAL;
 

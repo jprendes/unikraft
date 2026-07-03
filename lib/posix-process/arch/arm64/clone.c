@@ -10,7 +10,8 @@
 #include <uk/lcpu.h>
 
 void clone_setup_child_ctx(struct ukarch_execenv *pexecenv,
-			   struct uk_thread *child, __uptr sp)
+			   struct uk_thread *child, __uptr sp,
+			   int is_vfork)
 {
 	struct ukarch_execenv *cexecenv;
 	struct ukarch_auxspcb *auxspcb;
@@ -48,8 +49,8 @@ void clone_setup_child_ctx(struct ukarch_execenv *pexecenv,
 	/* Use new stack pointer */
 	uk_lcpu_regs_set(cexecenv->regs, SP, sp);
 
-	/* Use parent's userland TPIDR_EL0 if clone did not have SETTLS */
-	if (!child->tlsp)
+	/* For vfork, use parent's userland TPIDR_EL0 for stack canary compat */
+	if (is_vfork || !child->tlsp)
 		tlsp = uk_lcpu_sysctx_get(pexecenv->sysctx, TLSP);
 	else
 		tlsp = child->tlsp;

@@ -49,6 +49,7 @@ static void hl_buffer_pop(volatile void *buf_ptr)
  * Set by the elfloader dispatch setup; extern'd in sysctx_auxsp.c.
  */
 __uptr hyperlight_kernel_fsbase;
+__u64 hyperlight_user_stack_top;
 
 typedef void (*hl_run_fn)(void);
 typedef void (*hl_dispatch_fn)(const __u8 *fc_bytes, __sz fc_len);
@@ -146,6 +147,7 @@ static __u64 g_saved_lstar;
 static __u64 g_saved_star;
 static __u64 g_saved_sfmask;
 static __u64 g_saved_kernel_gs_base;
+static __u64 g_saved_user_fsbase;
 
 void hyperlight_dispatch_register(hl_run_fn fn) { g_run_callback = fn; }
 
@@ -321,6 +323,11 @@ hyperlight_dispatch_inner(void)
 {
 	hyperlight_dispatch_prepare();
 
+	{
+		__u64 rbp_val = (__u64)__builtin_frame_address(0);
+		hyperlight_user_stack_top = rbp_val + 16;
+	}
+
 	/* Peek the FunctionCall bytes first. hl_buffer_pop() rewinds the
 	 * stack pointer but doesn't overwrite the bytes themselves, so
 	 * the pointer we record here stays valid throughout the callback.
@@ -341,6 +348,21 @@ hyperlight_dispatch_inner(void)
 		g_current_fc_len = 0;
 	}
 
+	/* When the v2 dispatch callback is active, the loaded ELF has
+	 * already set FS_BASE to its own TLS (glibc/musl TCB).  After
+	 * snapshot+restore the snapshot's special registers hold the
+	 * kernel FS_BASE (saved at the end of the previous dispatch),
+	 * so the v2 callback would run with the wrong FS_BASE and crash
+	 * on any TLS access (errno, locale, etc.).  Restore the user's
+	 * FS_BASE before calling the callback, then save it afterward.
+	 */
+	if (g_dispatch_callback && g_saved_user_fsbase) {
+		__u32 lo = (__u32)g_saved_user_fsbase;
+		__u32 hi = (__u32)(g_saved_user_fsbase >> 32);
+		__asm__ volatile("wrmsr"
+				 : : "c"(0xC0000100), "a"(lo), "d"(hi));
+	}
+
 	if (g_dispatch_callback) {
 		if (peeked == 0)
 			g_dispatch_callback(fc_bytes, fc_len);
@@ -348,13 +370,15 @@ hyperlight_dispatch_inner(void)
 		g_run_callback();
 	}
 
-	/* After the callback returns, FS_BASE still points at user TLS
-	 * (glibc/musl set it during Py_Initialize / __libc_start_main).
-	 * Kernel services that dereference TLS (uk_printk uses locks +
-	 * per-CPU state, …) fault on that pointer. Restore the kernel's
-	 * FS_BASE before touching any of those. hyperlight_kernel_fsbase
-	 * is populated by app-elfloader right before it halts post-boot.
+	/* Save the user's FS_BASE before restoring the kernel's.
+	 * This value survives in the snapshot so the next dispatch
+	 * after restore can set FS_BASE correctly for the v2 callback.
 	 */
+	{
+		__u32 lo, hi;
+		__asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000100));
+		g_saved_user_fsbase = ((__u64)hi << 32) | lo;
+	}
 	if (hyperlight_kernel_fsbase) {
 		__u32 lo = (__u32)hyperlight_kernel_fsbase;
 		__u32 hi = (__u32)(hyperlight_kernel_fsbase >> 32);
