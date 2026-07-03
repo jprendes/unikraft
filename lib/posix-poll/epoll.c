@@ -561,7 +561,7 @@ int uk_sys_epoll_pwait2(const struct uk_file *epf, struct epoll_event *events,
 	struct epoll_entry **list;
 	__nsec deadline;
 
-#if CONFIG_PLAT_HYPERLIGHT
+#if CONFIG_PLAT_HYPERLIGHT && CONFIG_LIBPOSIX_PROCESS_MULTIPROCESS
 #if CONFIG_LIBHOSTSOCK
 	extern int hostsock_rescan_events(void);
 #endif
