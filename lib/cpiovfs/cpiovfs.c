@@ -645,8 +645,64 @@ cpiovfs_remove_impl(struct vnode *dvp, struct vnode *vp,
 #define cpiovfs_close     ((vnop_close_t)vfscore_vop_nullop)
 #define cpiovfs_seek      ((vnop_seek_t)vfscore_vop_nullop)
 #define cpiovfs_fsync     ((vnop_fsync_t)vfscore_vop_nullop)
-#define cpiovfs_rename    ((vnop_rename_t)vfscore_vop_erofs)
-#define cpiovfs_rmdir     ((vnop_rmdir_t)vfscore_vop_erofs)
+static int
+cpiovfs_rename(struct vnode *dvp1, struct vnode *vp1,
+	       const char *name1 __unused,
+	       struct vnode *dvp2, struct vnode *vp2 __unused,
+	       const char *name2)
+{
+	struct cpiovfs_node *np = vp1->v_data;
+
+	if (!np->ephemeral)
+		return EROFS;
+
+	struct cpiovfs_node *old_dnp = dvp1->v_data;
+	struct cpiovfs_node **pp;
+
+	for (pp = &old_dnp->child; *pp; pp = &(*pp)->next) {
+		if (*pp == np) {
+			*pp = np->next;
+			break;
+		}
+	}
+
+	char *newname = strdup(name2);
+
+	if (!newname)
+		return ENOMEM;
+	free(np->name);
+	np->name = newname;
+	np->namelen = strlen(name2);
+
+	struct cpiovfs_node *new_dnp = dvp2->v_data;
+
+	np->next = new_dnp->child;
+	new_dnp->child = np;
+
+	return 0;
+}
+static int
+cpiovfs_rmdir_impl(struct vnode *dvp, struct vnode *vp,
+		   const char *name __unused)
+{
+	struct cpiovfs_node *np = vp->v_data;
+
+	if (!np->ephemeral)
+		return EROFS;
+
+	struct cpiovfs_node *dnp = dvp->v_data;
+	struct cpiovfs_node **pp;
+	for (pp = &dnp->child; *pp; pp = &(*pp)->next) {
+		if (*pp == np) {
+			*pp = np->next;
+			free(np->name);
+			free(np);
+			return 0;
+		}
+	}
+	return ENOENT;
+}
+#define cpiovfs_rmdir cpiovfs_rmdir_impl
 #define cpiovfs_setattr   ((vnop_setattr_t)vfscore_vop_nullop)
 #define cpiovfs_link      ((vnop_link_t)vfscore_vop_erofs)
 #define cpiovfs_fallocate ((vnop_fallocate_t)vfscore_vop_einval)
@@ -695,3 +751,17 @@ static struct vfscore_fs_type fs_cpiovfs = {
 };
 
 UK_FS_REGISTER(fs_cpiovfs);
+
+int cpiovfs_vnode_data(struct vnode *vp, const char **data, size_t *size)
+{
+	struct cpiovfs_node *np;
+
+	if (!vp || !vp->v_data)
+		return -EINVAL;
+	np = CPIOVFS_NODE(vp);
+	if (data)
+		*data = np->data;
+	if (size)
+		*size = np->size;
+	return 0;
+}

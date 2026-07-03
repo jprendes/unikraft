@@ -27,6 +27,9 @@
 #include <uk/posix-fd.h>
 
 #include <hyperlight-x86/hcall.h>
+#include <uk/plat/time.h>
+
+extern void time_block_until(__snsec until);
 
 /* Max single RPC payload (matches HCALL_MAX_PAYLOAD). */
 #define HOSTSOCK_RPC_MAX 65536
@@ -450,7 +453,7 @@ static void hostsock_untrack(posix_sock *sock)
 	}
 }
 
-void hostsock_rescan_events(void);
+int hostsock_rescan_events(void);
 
 /* -------- socket operations -------- */
 
@@ -636,16 +639,26 @@ static ssize_t hostsock_recvfrom(posix_sock *sock,
 				 struct sockaddr *from,
 				 socklen_t *restrict fromlen)
 {
+	struct hostsock_data *sd = posix_sock_get_data(sock);
+
 	/*
-	 * Always check readiness — a blocking recv hcall would freeze the
-	 * entire VM.  See the comment in hostsock_accept4.
+	 * Poll readiness with timed retries.  A blocking recv hcall would
+	 * freeze the entire VM, so we must poll the host ourselves.
+	 * We retry for up to ~30 s (300 × 100 ms) to cover slow network
+	 * round-trips.  Each sleep call lets the host poll sockets too.
 	 */
-	{
-		struct hostsock_data *sd = posix_sock_get_data(sock);
+	for (int attempt = 0; attempt < 300; attempt++) {
 		int ready = hostsock_check_ready(sd->host_fd, 1);
-		if (!(ready & 1))
+		if (ready & 1)
+			goto do_recv;
+		if (sd->nonblock || (flags & MSG_DONTWAIT))
 			return -EAGAIN;
+		time_block_until((__snsec)ukplat_monotonic_clock()
+				 + 100000000LL);
 	}
+	return -EAGAIN;
+
+do_recv:
 
 	int n = build_req(
 		"{\"name\":\"net_recvfrom\",\"args\":"
@@ -882,8 +895,10 @@ static void hostsock_poll_setup(posix_sock *sock)
 	hostsock_track(sock);
 }
 
-void hostsock_rescan_events(void)
+int hostsock_rescan_events(void)
 {
+	int woke = 0;
+
 	for (int i = 0; i < tracked_count; i++) {
 		posix_sock *sock = tracked_socks[i];
 		uint32_t fd = get_host_fd(sock);
@@ -893,9 +908,12 @@ void hostsock_rescan_events(void)
 			events |= UKFD_POLLIN;
 		if (revents & 4)
 			events |= UKFD_POLLOUT;
-		if (events)
+		if (events) {
 			posix_sock_event_set(sock, events);
+			woke = 1;
+		}
 	}
+	return woke;
 }
 
 static struct posix_socket_ops hostsock_ops = {
