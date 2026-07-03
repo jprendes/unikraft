@@ -561,6 +561,78 @@ int uk_sys_epoll_pwait2(const struct uk_file *epf, struct epoll_event *events,
 	struct epoll_entry **list;
 	__nsec deadline;
 
+#if CONFIG_PLAT_HYPERLIGHT
+#if CONFIG_LIBHOSTSOCK
+	extern int hostsock_rescan_events(void);
+#endif
+	extern void time_block_until(__snsec until);
+
+	if (unlikely(epf->vol != EPOLL_VOLID))
+		return -EINVAL;
+	if (unlikely(!events))
+		return -EFAULT;
+	if (unlikely(maxevents <= 0))
+		return -EINVAL;
+
+	list = (struct epoll_entry **)epf->node;
+
+	if (timeout) {
+		__snsec tout = uk_time_spec_to_nsec(timeout);
+
+		if (tout < 0)
+			return -EINVAL;
+		deadline = ukplat_monotonic_clock() + tout;
+	} else {
+		deadline = 0;
+	}
+
+	for (;;) {
+		int nout = 0;
+
+#if CONFIG_LIBHOSTSOCK
+		hostsock_rescan_events();
+#endif
+		for (struct epoll_entry *p = *list;
+		     p && nout < maxevents;
+		     p = p->next) {
+			unsigned int revents;
+			unsigned int *revp;
+
+#if CONFIG_LIBVFSCORE
+			if (p->legacy)
+				revp = &p->legacy_cb.revents;
+			else
+#endif
+				revp = &p->revents;
+
+			revents = uk_exchange_n(revp, 0);
+			if (revents) {
+				events[nout].events = revents;
+				events[nout].data = p->event.data;
+				nout++;
+			}
+		}
+		if (nout)
+			return nout;
+
+		if (deadline
+		    && (__snsec)ukplat_monotonic_clock() >= (__snsec)deadline)
+			break;
+		if (!deadline && !*list)
+			break;
+		{
+			__snsec now = (__snsec)ukplat_monotonic_clock();
+			__snsec cap = now + 100000000LL;
+			__snsec until = deadline ? deadline : cap;
+
+			if (until > cap)
+				until = cap;
+			time_block_until(until);
+		}
+	}
+	return 0;
+#endif
+
 	if (unlikely(epf->vol != EPOLL_VOLID))
 		return -EINVAL;
 	if (unlikely(!events))
