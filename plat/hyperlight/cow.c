@@ -13,6 +13,7 @@
 #include <uk/essentials.h>
 #include <uk/event.h>
 #include <uk/lcpu.h>
+#include <uk/lcpu/except.h>
 #include <string.h>
 
 /* Hyperlight scratch memory layout constants (amd64) */

@@ -138,8 +138,6 @@ void uk_syscall_exittab_run(struct uk_syscall_exit_ctx *exit_ctx)
 		if (!entry->func)
 			continue;
 
-		uk_pr_debug("Call syscall exit table entry: %p(%p)...\n",
-			    entry->func, exit_ctx);
 		(*entry->func)(exit_ctx);
 	}
 }
