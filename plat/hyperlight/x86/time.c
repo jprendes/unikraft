@@ -115,7 +115,7 @@ static int hyperlight_sleep_ns(__u64 ns)
 }
 
 #ifdef CONFIG_LIBHOSTSOCK
-extern void hostsock_rescan_events(void);
+extern int hostsock_rescan_events(void);
 #endif
 
 /* Block CPU until the specified time or pending events.
@@ -137,9 +137,9 @@ void time_block_until(__snsec until)
 
 		if (hyperlight_sleep_ns(sleep_ns)) {
 #ifdef CONFIG_LIBHOSTSOCK
-			hostsock_rescan_events();
+			if (hostsock_rescan_events())
+				break;
 #endif
-			break;
 		}
 	}
 }
