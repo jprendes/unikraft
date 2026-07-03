@@ -557,6 +557,7 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 		 * pprocess pointer to it — so its queue may hold
 		 * entries the restored pprocess doesn't expect.
 		 */
+#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
 		if (parent_pt->process && parent_pt->process->signal) {
 			struct uk_signal_pdesc *pd =
 				parent_pt->process->signal;
@@ -566,6 +567,7 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 					&pd->sigqueue.list_head[_i]);
 			pd->queued_count = 0;
 		}
+#endif
 #endif
 		memcpy((void *)parent_rsp, stack_save, vfork_save_sz);
 		uk_free(s->a, stack_save);
