@@ -274,6 +274,11 @@ void uk_plat_native_except_err_handler(int trapnr,
 	int rc;
 
 #if CONFIG_PLAT_HYPERLIGHT
+	/* Read CR2 exactly once, before anything that could trigger a
+	 * nested page fault and overwrite CR2.
+	 */
+	__u64 cr2 = uk_arch_x86_64_rdcr2();
+
 	extern __uptr hyperlight_kernel_fsbase;
 	__u64 saved_fsbase = 0;
 	if (hyperlight_kernel_fsbase) {
@@ -292,6 +297,7 @@ void uk_plat_native_except_err_handler(int trapnr,
 		saved_pf_ist = pf_desc->ist;
 		pf_desc->ist = 0;
 	}
+
 #endif
 
 	ctx = (struct uk_plat_native_except_err_ctx){
@@ -300,7 +306,11 @@ void uk_plat_native_except_err_handler(int trapnr,
 		.str = x86_exception_table[trapnr],
 		.error_code = error_code,
 		.handler_err = 0,
+#if CONFIG_PLAT_HYPERLIGHT
+		.cr2 = cr2,
+#else
 		.cr2 = uk_arch_x86_64_rdcr2(),
+#endif
 	};
 
 	rc = uk_raise_event_ptr(trap_event_table[trapnr], &ctx);

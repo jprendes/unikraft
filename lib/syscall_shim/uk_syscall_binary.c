@@ -146,10 +146,11 @@ uk_syscall_entertab_prio(binary_syscall_debug_handler, UK_PRIO_EARLIEST);
 #if CONFIG_LIBSYSCALL_SHIM_STRACE
 static void binary_syscall_strace(struct uk_syscall_exit_ctx *exit_ctx)
 {
+	return;
 #if CONFIG_LIBSYSCALL_SHIM_STRACE_ANSI_COLOR
-	char prsyscallbuf[512]; /* ANSI color is pretty hungry */
+	static char prsyscallbuf[512];
 #else /* !CONFIG_LIBSYSCALL_SHIM_STRACE_ANSI_COLOR */
-	char prsyscallbuf[256];
+	static char prsyscallbuf[256];
 #endif /* !CONFIG_LIBSYSCALL_SHIM_STRACE_ANSI_COLOR */
 	int prsyscalllen __maybe_unused;
 	struct ukarch_execenv *execenv;
