@@ -33,7 +33,8 @@ static __uk_tls struct {
  * the flags handlers have registered for.
  */
 static __u64 cl_flags_handled = CLONE_THREAD | CLONE_VFORK | CLONE_VM |
-				CLONE_CHILD_SETTID | CLONE_PARENT_SETTID |
+				CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID |
+				CLONE_PARENT_SETTID |
 				CLONE_SETTLS | CLONE_DETACHED;
 
 /*

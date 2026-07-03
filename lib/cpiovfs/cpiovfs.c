@@ -316,6 +316,20 @@ cpiovfs_unmount(struct mount *mp, int flags __unused)
 
 /* ---- VNode Operations ---- */
 
+static inline int
+cpiovfs_node_valid(const struct cpiovfs_node *np)
+{
+	__uptr addr = (__uptr)np;
+
+	if (addr < 0x1000 || addr >= 0x80000000ULL || (addr & 7))
+		return 0;
+	if (np->namelen == 0 || np->namelen > 4096)
+		return 0;
+	if (np->type > 7)
+		return 0;
+	return 1;
+}
+
 static int
 cpiovfs_lookup(struct vnode *dvp, const char *name, struct vnode **vpp)
 {
@@ -325,6 +339,9 @@ cpiovfs_lookup(struct vnode *dvp, const char *name, struct vnode **vpp)
 	size_t len;
 
 	*vpp = NULL;
+
+	if (!dnp)
+		return ENOENT;
 
 	if (*name == '\0')
 		return ENOENT;

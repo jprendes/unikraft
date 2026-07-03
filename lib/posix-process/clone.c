@@ -474,6 +474,7 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 	if (flags & CLONE_VFORK) {
 		struct posix_thread *parent_pt = pthread_self;
 		__u64 parent_rsp;
+		__u64 vfork_save_sz;
 		void *stack_save;
 		/* fork is promoted to vfork (CLONE_VM): the child shares
 		 * the parent's userspace stack.  Between _Fork()'s return
@@ -483,7 +484,7 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 		 * Save the parent's stack region and restore it after the
 		 * child calls execve or _exit.
 		 */
-#define VFORK_STACK_SAVE_SZ 8192
+#define VFORK_STACK_SAVE_SZ (256 * 1024)
 
 #if CONFIG_PLAT_HYPERLIGHT
 		if (!parent_pt)
@@ -492,33 +493,23 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 		UK_ASSERT(parent_pt);
 
 		parent_rsp = uk_lcpu_regs_get(execenv->regs, SP);
-		stack_save = uk_malloc(s->a, VFORK_STACK_SAVE_SZ);
-		UK_ASSERT(stack_save);
 		{
-			__u64 save_sz = VFORK_STACK_SAVE_SZ;
 #if CONFIG_PLAT_HYPERLIGHT
-			/* Cap at the mapped stack region above RSP.
-			 * On Hyperlight the user stack may live in
-			 * VMM-mapped pages at the top of the address
-			 * space rather than in the elfloader-allocated
-			 * region. Compute a safe upper bound: 2 pages
-			 * above the page containing RSP (the page
-			 * containing RSP + the one above it are
-			 * guaranteed mapped since the stack is active).
-			 */
-			{
-				__u64 safe_top;
-				if (hyperlight_user_stack_top &&
-				    parent_rsp < hyperlight_user_stack_top)
-					safe_top = hyperlight_user_stack_top;
-				else
-					safe_top = (parent_rsp & ~0xFFFULL)
-						   + 0x2000;
-				if (safe_top > parent_rsp &&
-				    (safe_top - parent_rsp) < save_sz)
-					save_sz = safe_top - parent_rsp;
-			}
+			extern __u64 hyperlight_user_stack_top;
+			__u64 save_sz;
+			if (hyperlight_user_stack_top
+			    && parent_rsp < hyperlight_user_stack_top)
+				save_sz = hyperlight_user_stack_top - parent_rsp;
+			else
+				save_sz = VFORK_STACK_SAVE_SZ;
+			if (save_sz > 256 * 1024)
+				save_sz = 256 * 1024;
+#else
+			__u64 save_sz = VFORK_STACK_SAVE_SZ;
 #endif
+			vfork_save_sz = save_sz;
+			stack_save = uk_malloc(s->a, save_sz);
+			UK_ASSERT(stack_save);
 			memcpy(stack_save, (void *)parent_rsp, save_sz);
 		}
 
@@ -559,25 +550,24 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 				 sizeof(saved_pthread));
 		pthread_self = saved_pthread_self_val;
 		parent_pt->state = POSIX_THREAD_RUNNING;
-#endif
-		{
-			__u64 restore_sz = VFORK_STACK_SAVE_SZ;
-#if CONFIG_PLAT_HYPERLIGHT
-			{
-				__u64 safe_top;
-				if (hyperlight_user_stack_top &&
-				    parent_rsp < hyperlight_user_stack_top)
-					safe_top = hyperlight_user_stack_top;
-				else
-					safe_top = (parent_rsp & ~0xFFFULL)
-						   + 0x2000;
-				if (safe_top > parent_rsp &&
-				    (safe_top - parent_rsp) < restore_sz)
-					restore_sz = safe_top - parent_rsp;
-			}
-#endif
-			memcpy((void *)parent_rsp, stack_save, restore_sz);
+
+		/* Flush stale signals queued by the child's exit
+		 * (e.g. SIGCHLD from signal_exit).  The signal
+		 * descriptor was NOT saved/restored — only the
+		 * pprocess pointer to it — so its queue may hold
+		 * entries the restored pprocess doesn't expect.
+		 */
+		if (parent_pt->process && parent_pt->process->signal) {
+			struct uk_signal_pdesc *pd =
+				parent_pt->process->signal;
+			uk_sigemptyset(&pd->sigqueue.pending);
+			for (int _i = 0; _i < SIG_ARRAY_COUNT; _i++)
+				UK_INIT_LIST_HEAD(
+					&pd->sigqueue.list_head[_i]);
+			pd->queued_count = 0;
 		}
+#endif
+		memcpy((void *)parent_rsp, stack_save, vfork_save_sz);
 		uk_free(s->a, stack_save);
 
 		goto out;

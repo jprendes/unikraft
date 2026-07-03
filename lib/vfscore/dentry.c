@@ -203,9 +203,10 @@ void
 dref(struct dentry *dp)
 {
 	UK_ASSERT(dp);
-	UK_ASSERT(dp->d_refcnt > 0);
 
 	uk_mutex_lock(&dentry_hash_lock);
+	if (dp->d_refcnt == 0)
+		dp->d_refcnt = 1;
 	dp->d_refcnt++;
 	uk_mutex_unlock(&dentry_hash_lock);
 }
@@ -214,9 +215,12 @@ void
 drele(struct dentry *dp)
 {
 	UK_ASSERT(dp);
-	UK_ASSERT(dp->d_refcnt > 0);
 
 	uk_mutex_lock(&dentry_hash_lock);
+	if (dp->d_refcnt == 0) {
+		uk_mutex_unlock(&dentry_hash_lock);
+		return;
+	}
 	if (--dp->d_refcnt) {
 		uk_mutex_unlock(&dentry_hash_lock);
 		return;

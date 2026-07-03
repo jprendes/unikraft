@@ -122,8 +122,13 @@ int uk_posix_clone_sighand(void *arg)
 		if (unlikely(rc))
 			goto fail_malloc;
 
-		memcpy(cp->signal->sigaction, pp->signal->sigaction,
-		       sizeof(*cp->signal->sigaction));
+		if (pp->signal && pp->signal->sigaction)
+			memcpy(cp->signal->sigaction, pp->signal->sigaction,
+			       sizeof(*cp->signal->sigaction));
+		else
+			pprocess_signal_foreach(signum)
+				pprocess_signal_sigaction_clear(
+					KERN_SIGACTION(cp, signum));
 	}
 
 	/* The child process has no pending signals */
@@ -134,12 +139,7 @@ int uk_posix_clone_sighand(void *arg)
 	pprocess_signal_foreach(signum)
 		UK_INIT_LIST_HEAD(&cp->signal->sigqueue.list_head[signum]);
 
-	if (pp) {
-		/* sigaltstack(2): Children created with clone() inherit the
-		 * parent's altstack settings, unless clone() was passed the
-		 * CLONE_VM and not CLONE_VFORK. In that case the altstack
-		 * inherited by the parent is disabled.
-		 */
+	if (pp && pp->signal) {
 		memcpy(&cp->signal->altstack, &pp->signal->altstack, sizeof(stack_t));
 		if ((cl_args->flags & CLONE_VM) && !(cl_args->flags & CLONE_VFORK))
 			cp->signal->altstack.ss_flags = SS_DISABLE;

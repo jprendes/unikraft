@@ -152,5 +152,11 @@ void uk_plat_native_set_auxsp(__uptr auxsp)
 	auxspcb = ukarch_auxsp_get_cb(auxsp);
 	sc = (struct uk_plat_native_sysctx *)auxspcb->uksysctx;
 	sc->gsbase = rdgsbasefn();
+
+#if CONFIG_PLAT_HYPERLIGHT
+	extern __uptr hyperlight_kernel_fsbase;
+	if (hyperlight_kernel_fsbase)
+		hyperlight_kernel_fsbase = uk_plat_native_rdfsbasefn();
+#endif
 }
 #endif /* CONFIG_LIBUKPLAT_NATIVE_AUXSP */

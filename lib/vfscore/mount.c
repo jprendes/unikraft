@@ -219,6 +219,9 @@ UK_SYSCALL_R_DEFINE(int, mount, const char*, dev, const char*, dir,
 		vput(vp);
 		goto err3;
 	}
+	/* Hold an extra reference so child drele cascades can never
+	 * decrement the mount root below 1. */
+	dref(mp->m_root);
 	vput(vp);
 
 	/*
@@ -239,6 +242,7 @@ UK_SYSCALL_R_DEFINE(int, mount, const char*, dev, const char*, dir,
 
 	return 0;   /* success */
  err4:
+	drele(mp->m_root);
 	drele(mp->m_root);
  err3:
 	if (dp_covered)
@@ -264,7 +268,8 @@ vfscore_release_mp_dentries(struct mount *mp)
 		drele(mp->m_covered);
 	}
 
-	/* Release root dentry */
+	/* Release root dentry (two dreles: one for alloc, one for extra mount ref) */
+	drele(mp->m_root);
 	drele(mp->m_root);
 }
 

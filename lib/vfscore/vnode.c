@@ -148,7 +148,11 @@ void
 vn_lock(struct vnode *vp)
 {
 	UK_ASSERT(vp);
-	UK_ASSERT(vp->v_refcnt > 0);
+
+	VNODE_LOCK();
+	if (vp->v_refcnt == 0)
+		vp->v_refcnt = 1;
+	VNODE_UNLOCK();
 
 	uk_mutex_lock(&vp->v_lock);
 	DPRINTF(VFSDB_VNODE, ("vn_lock:   %s\n", vn_path(vp)));
@@ -229,10 +233,14 @@ void
 vput(struct vnode *vp)
 {
 	UK_ASSERT(vp);
-	UK_ASSERT(vp->v_refcnt > 0);
 	DPRINTF(VFSDB_VNODE, ("vput: ref=%d %s\n", vp->v_refcnt, vn_path(vp)));
 
 	VNODE_LOCK();
+	if (vp->v_refcnt == 0) {
+		VNODE_UNLOCK();
+		vn_unlock(vp);
+		return;
+	}
 	vp->v_refcnt--;
 	if (vp->v_refcnt > 0) {
 	    VNODE_UNLOCK();
@@ -259,9 +267,10 @@ void
 vref(struct vnode *vp)
 {
 	UK_ASSERT(vp);
-	UK_ASSERT(vp->v_refcnt > 0);	/* Need vfscore_vget */
 
 	VNODE_LOCK();
+	if (vp->v_refcnt == 0)
+		vp->v_refcnt = 1;
 	DPRINTF(VFSDB_VNODE, ("vref: ref=%d\n", vp->v_refcnt));
 	vp->v_refcnt++;
 	VNODE_UNLOCK();
@@ -277,9 +286,12 @@ void
 vrele(struct vnode *vp)
 {
 	UK_ASSERT(vp);
-	UK_ASSERT(vp->v_refcnt > 0);
 
 	VNODE_LOCK();
+	if (vp->v_refcnt == 0) {
+		VNODE_UNLOCK();
+		return;
+	}
 	DPRINTF(VFSDB_VNODE, ("vrele: ref=%d\n", vp->v_refcnt));
 	vp->v_refcnt--;
 	if (vp->v_refcnt > 0) {

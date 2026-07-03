@@ -132,6 +132,9 @@ void pprocess_exit_pthread(struct posix_thread *pthread,
 		uk_thread_wake(parent_pthread->thread);
 		parent_pthread->state = POSIX_THREAD_RUNNING;
 	}
+#if CONFIG_PLAT_HYPERLIGHT
+	hyperlight_vfork_parent_thread = NULL;
+#endif
 
 	/* Release pthread and terminate the underlying uk_thread
 	 * unless it's the current one or if it hasn't been associated
@@ -168,21 +171,16 @@ void pprocess_exit(struct posix_process *pprocess,
 	parent_process = pprocess->parent;
 
 #if CONFIG_LIBPOSIX_PROCESS_SIGNAL
-	/* As this will be signaling the parent on behalf of the current
-	 * pthread, we must do this before we terminate the pthreads, in
-	 * case we are called from _exit(), exit_group() (i.e. operate on
-	 * current).
-	 */
+#if CONFIG_PLAT_HYPERLIGHT
+	if (parent_process && pprocess->pid <= 2) {
+#else
 	if (parent_process) {
+#endif
 		ret = signal_exit(parent_process);
 		if (ret > 0) {
-			/* From exit(2): "If the parent has set SA_NOCLDWAIT, or
-			 * has set the SIGCHLD handler to SIG_IGN, the status is
-			 * discarded and the child dies immediately."
-			 */
 			uk_pr_info("Parent ignores SIGHLD, terminating\n");
 			nowait = true;
-		} else if (unlikely(ret < 0)) { /* no choice here but crash */
+		} else if (unlikely(ret < 0)) {
 			UK_CRASH("Could not signal parent (%d)\n", ret);
 		}
 	}
@@ -243,9 +241,6 @@ void pprocess_exit(struct posix_process *pprocess,
  */
 UK_LLSYSCALL_R_DEFINE(int, exit, int, status)
 {
-#if CONFIG_PLAT_HYPERLIGHT
-	uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
-#else
 	struct posix_thread *this_pthread;
 	struct uk_thread *this_thread;
 
@@ -254,6 +249,12 @@ UK_LLSYSCALL_R_DEFINE(int, exit, int, status)
 
 	UK_ASSERT(this_pthread);
 	UK_ASSERT(this_pthread->process);
+
+#if CONFIG_PLAT_HYPERLIGHT
+	if (this_pthread->process->pid <= 2) {
+		uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
+	}
+#endif
 
 	/* Last thread, exit the process */
 	if (uk_list_is_singular(&this_pthread->process->threads)) {
@@ -264,26 +265,23 @@ UK_LLSYSCALL_R_DEFINE(int, exit, int, status)
 
 	pprocess_exit_pthread(this_pthread, POSIX_THREAD_EXITED, status);
 	uk_sched_thread_exit();
-#endif
 }
 
 UK_LLSYSCALL_R_DEFINE(int, exit_group, int, status)
 {
-#if CONFIG_PLAT_HYPERLIGHT
-	/* On Hyperlight, go directly to ukplat_terminate to ensure
-	 * the void result is pushed to the output buffer before halt.
-	 * The scheduler's idle path would do a bare hlt instead.
-	 */
-	uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
-#else
 	struct posix_process *pprocess;
 
 	pprocess = uk_pprocess_current();
 	UK_ASSERT(pprocess);
 
+#if CONFIG_PLAT_HYPERLIGHT
+	if (pprocess->pid <= 2) {
+		uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
+	}
+#endif
+
 	pprocess_exit(pprocess, POSIX_PROCESS_EXITED, status);
 	uk_sched_thread_exit();
-#endif
 }
 #else /* !CONFIG_LIBPOSIX_PROCESS_MULTITHREADING */
 __noreturn void pprocess_exit_stub(int status)

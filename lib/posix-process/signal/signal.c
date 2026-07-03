@@ -37,7 +37,9 @@ static int pprocess_signal_enqueue(struct posix_process *pproc,
 	UK_ASSERT(pproc);
 
 	if (pthread)
-		UK_ASSERT(pthread->process == pproc);
+	#if !CONFIG_PLAT_HYPERLIGHT
+	UK_ASSERT(pthread->process == pproc);
+#endif
 
 	if (unlikely(pproc->signal->queued_count >= pproc->signal->queued_max))
 		return -EAGAIN;
@@ -83,7 +85,9 @@ struct uk_signal *pprocess_signal_dequeue(struct posix_process *pproc,
 	UK_ASSERT(pproc);
 
 	if (pthread) {
-		UK_ASSERT(pthread->process == pproc);
+	#if !CONFIG_PLAT_HYPERLIGHT
+	UK_ASSERT(pthread->process == pproc);
+#endif
 		sigqueue = &pthread->signal->sigqueue;
 	} else {
 		sigqueue = &pproc->signal->sigqueue;

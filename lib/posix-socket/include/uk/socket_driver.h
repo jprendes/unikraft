@@ -667,7 +667,13 @@ posix_socket_write(posix_sock *sock, const struct iovec *iov,
 {
 	struct posix_socket_driver *d = posix_sock_get_driver(sock);
 
+
+#if CONFIG_PLAT_HYPERLIGHT
+	if (!d->ops->write)
+		return -ENOSYS;
+#else
 	UK_ASSERT(d->ops->write);
+#endif
 	return d->ops->write(sock, iov, iovcnt);
 }
 
@@ -677,7 +683,12 @@ posix_socket_read(posix_sock *sock, const struct iovec *iov,
 {
 	struct posix_socket_driver *d = posix_sock_get_driver(sock);
 
+#if CONFIG_PLAT_HYPERLIGHT
+	if (!d->ops->read)
+		return -ENOSYS;
+#else
 	UK_ASSERT(d->ops->read);
+#endif
 	return d->ops->read(sock, iov, iovcnt);
 }
 
@@ -686,7 +697,12 @@ posix_socket_close(posix_sock *sock)
 {
 	struct posix_socket_driver *d = posix_sock_get_driver(sock);
 
+#if CONFIG_PLAT_HYPERLIGHT
+	if (!d->ops->close)
+		return -ENOSYS;
+#else
 	UK_ASSERT(d->ops->close);
+#endif
 	return d->ops->close(sock);
 }
 
@@ -695,7 +711,12 @@ posix_socket_ioctl(posix_sock *sock, int request, void *argp)
 {
 	struct posix_socket_driver *d = posix_sock_get_driver(sock);
 
+#if CONFIG_PLAT_HYPERLIGHT
+	if (!d->ops->ioctl)
+		return -ENOSYS;
+#else
 	UK_ASSERT(d->ops->ioctl);
+#endif
 	return d->ops->ioctl(sock, request, argp);
 }
 
