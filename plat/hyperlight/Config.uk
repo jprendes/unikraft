@@ -46,11 +46,29 @@ config HYPERLIGHT_SYSCALL_PROFILE
 	  the user-visible output — keep off for production images.
 
 config HYPERLIGHT_HCALL
-	bool "Enable /dev/hcall host function call device"
+	bool "Enable in-kernel host function call API"
 	default n
-	depends on LIBDEVFS
 	help
-	  Provides /dev/hcall for user-space to call host-registered
-	  functions via the Hyperlight dispatch protocol.
+	  Build the in-kernel hyperlight_hcall() primitive that issues
+	  synchronous Hyperlight __dispatch host function calls. Kernel
+	  components (poll, hostfs, hostsock, time) use it directly.
+
+	  When LIBDEVFS is also enabled, a /dev/hcall device is registered
+	  so user-space can call host-registered functions via the same
+	  dispatch protocol.
+
+config HYPERLIGHT_POLL
+	bool "Enable cooperative poll execution model"
+	default n
+	depends on LIBUKSCHED && LIBUKSCHEDCOOP
+	select HYPERLIGHT_HCALL
+	help
+	  Add a `poll` guest function that runs the unikernel scheduler
+	  until it would go idle, then exits the VM back to the host with
+	  a next-wakeup deadline. The host repeatedly invokes `poll` to
+	  drive execution forward. This lets a long-lived guest yield the
+	  vCPU whenever it has no runnable work, instead of running a
+	  single guest function to completion. Requires the in-kernel
+	  host-call API (HYPERLIGHT_HCALL) to report the deadline.
 
 endif

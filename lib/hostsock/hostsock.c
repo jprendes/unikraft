@@ -642,23 +642,23 @@ static ssize_t hostsock_recvfrom(posix_sock *sock,
 	struct hostsock_data *sd = posix_sock_get_data(sock);
 
 	/*
-	 * Poll readiness with timed retries.  A blocking recv hcall would
-	 * freeze the entire VM, so we must poll the host ourselves.
-	 * We retry for up to ~30 s (300 × 100 ms) to cover slow network
-	 * round-trips.  Each sleep call lets the host poll sockets too.
+	 * Always check readiness before calling the host's blocking recv.
+	 * A blocking hcall freezes the entire VM (single vCPU), so we must
+	 * never let recv block on the host side.  Return EAGAIN and let the
+	 * Unikraft poll/epoll layer handle the wait — the posix-socket
+	 * recvfrom/recvmsg wrappers retry via uk_file_poll(), which yields
+	 * to the scheduler cooperatively (poll_step-friendly) instead of
+	 * busy-looping here.  This mirrors hostsock_accept4.
+	 *
+	 * The pre-check also covers runtimes that set non-blocking mode via
+	 * fcntl(F_SETFL, O_NONBLOCK) rather than ioctl(FIONBIO) — fcntl
+	 * updates the uk_file flags but not our sd->nonblock field.
 	 */
-	for (int attempt = 0; attempt < 300; attempt++) {
+	{
 		int ready = hostsock_check_ready(sd->host_fd, 1);
-		if (ready & 1)
-			goto do_recv;
-		if (sd->nonblock || (flags & MSG_DONTWAIT))
+		if (!(ready & 1)) /* POLLIN */
 			return -EAGAIN;
-		time_block_until((__snsec)ukplat_monotonic_clock()
-				 + 100000000LL);
 	}
-	return -EAGAIN;
-
-do_recv:
 
 	int n = build_req(
 		"{\"name\":\"net_recvfrom\",\"args\":"

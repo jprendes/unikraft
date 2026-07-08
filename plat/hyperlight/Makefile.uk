@@ -58,3 +58,6 @@ LIBHYPERLIGHTPLAT_SRCS-y		 += $(UK_PLAT_COMMON_BASE)/bootinfo.lds.S|common
 
 ## Host function call device (/dev/hcall)
 LIBHYPERLIGHTPLAT_SRCS-$(CONFIG_HYPERLIGHT_HCALL) += $(LIBHYPERLIGHTPLAT_BASE)/hcall.c
+
+## Cooperative poll execution model
+LIBHYPERLIGHTPLAT_SRCS-$(CONFIG_HYPERLIGHT_POLL) += $(LIBHYPERLIGHTPLAT_BASE)/poll.c

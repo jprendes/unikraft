@@ -29,8 +29,10 @@
 #include <uk/print.h>
 #include <uk/assert.h>
 #include <uk/essentials.h>
+#if CONFIG_LIBDEVFS
 #include <vfscore/uio.h>
 #include <devfs/device.h>
+#endif /* CONFIG_LIBDEVFS */
 
 #include <hyperlight-x86/peb.h>
 #include <hyperlight-x86/setup.h>
@@ -419,7 +421,13 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 
 /* ========================================================================
  * /dev/hcall Device Driver
+ *
+ * Only built when devfs is available. The in-kernel hyperlight_hcall()
+ * primitive above is always compiled so kernel components (poll, hostfs,
+ * hostsock, time) can call the host without a devfs round-trip.
  * ======================================================================== */
+
+#if CONFIG_LIBDEVFS
 
 /* Static buffers — user-space device tracks the last response across
  * read() calls (see dev_hcall_read for the pos/len state machine).
@@ -548,3 +556,5 @@ static int devfs_register_hcall(struct uk_init_ctx *ictx __unused)
 }
 
 devfs_initcall(devfs_register_hcall);
+
+#endif /* CONFIG_LIBDEVFS */

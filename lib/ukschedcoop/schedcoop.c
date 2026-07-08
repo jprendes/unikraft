@@ -37,6 +37,14 @@
 #include <uk/schedcoop.h>
 #include <uk/essentials.h>
 #include "schedcoop.h"
+#if CONFIG_HYPERLIGHT_POLL
+/* Declared locally to avoid a build-time include dependency on the
+ * Hyperlight platform headers from the scheduler library. Definitions
+ * live in plat/hyperlight/poll.c.
+ */
+int hyperlight_poll_active(void);
+void hyperlight_poll_idle_return(struct uk_sched *s, __nsec wakeup_time);
+#endif
 
 static void schedcoop_schedule(struct uk_sched *s)
 {
@@ -219,6 +227,19 @@ static __noreturn void idle_thread_fn(void *argp)
 		now = ukplat_monotonic_clock();
 
 		if (!wake_up_time || wake_up_time > now) {
+#if CONFIG_HYPERLIGHT_POLL
+			/* Cooperative poll model: if a host `poll` invocation
+			 * is driving the scheduler, hand control back to the
+			 * host with the next wakeup deadline instead of
+			 * halting the CPU in-guest. Resumes here on the next
+			 * `poll`. If no poll is in flight this returns and we
+			 * fall through to the normal in-guest halt below.
+			 */
+			if (hyperlight_poll_active()) {
+				hyperlight_poll_idle_return(&c->sched,
+							    wake_up_time);
+			} else
+#endif /* CONFIG_HYPERLIGHT_POLL */
 			if (wake_up_time)
 				uk_lcpu_halt_irq_until(wake_up_time);
 			else
