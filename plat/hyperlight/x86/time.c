@@ -118,6 +118,12 @@ static int hyperlight_sleep_ns(__u64 ns)
 extern int hostsock_rescan_events(void);
 #endif
 
+#ifdef CONFIG_HYPERLIGHT_POLL
+#include <uk/thread.h>
+#include <uk/sched.h>
+#include <hyperlight-x86/poll.h>
+#endif /* CONFIG_HYPERLIGHT_POLL */
+
 /* Block CPU until the specified time or pending events.
  *
  * Uses __hl_sleep instead of bare HLT so the host can simultaneously
@@ -125,6 +131,35 @@ extern int hostsock_rescan_events(void);
  */
 void time_block_until(__snsec until)
 {
+#ifdef CONFIG_HYPERLIGHT_POLL
+	/*
+	 * Cooperative poll model: when a host `poll` invocation is driving the
+	 * scheduler, a timer wait must PARK the calling thread and yield so the
+	 * scheduler can run the other threads and reach the idle thread, which
+	 * hands control back to the host (hyperlight_poll_idle_return) with the
+	 * next wakeup deadline. Looping on __hl_sleep here instead keeps the
+	 * vCPU inside this same host `poll` call — __hl_sleep is a *nested*
+	 * hostcall that resumes the guest in place — so the host-side
+	 * `poll_step` never returns and checkpoint/restore stalls (the host
+	 * eventually kills the vCPU to break out).
+	 *
+	 * This parks on a pure timer. Readiness delivered through a pollq
+	 * (e.g. host sockets via hostsock_rescan_events) does NOT wake a
+	 * timer-parked thread early, so callers waiting on such events should
+	 * park on the relevant pollq (uk_file_poll_until) for prompt,
+	 * event-driven wakeups rather than relying on this deadline.
+	 */
+	if (hyperlight_poll_active()) {
+		struct uk_thread *current = uk_thread_current();
+
+		if (current) {
+			uk_thread_block_until(current, until);
+			uk_sched_yield();
+			return;
+		}
+	}
+#endif /* CONFIG_HYPERLIGHT_POLL */
+
 	while ((__snsec) ukplat_monotonic_clock() < until) {
 		__snsec remaining = until - (__snsec)ukplat_monotonic_clock();
 		if (remaining <= 0)
