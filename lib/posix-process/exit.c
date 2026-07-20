@@ -250,14 +250,12 @@ UK_LLSYSCALL_R_DEFINE(int, exit, int, status)
 	UK_ASSERT(this_pthread);
 	UK_ASSERT(this_pthread->process);
 
-#if CONFIG_PLAT_HYPERLIGHT
-	if (this_pthread->process->pid <= 2) {
-		uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
-	}
-#endif
-
 	/* Last thread, exit the process */
 	if (uk_list_is_singular(&this_pthread->process->threads)) {
+#if CONFIG_PLAT_HYPERLIGHT
+		if (this_pthread->process->pid <= 2)
+			uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
+#endif
 		pprocess_exit(this_pthread->process, POSIX_PROCESS_EXITED,
 			      status);
 		uk_sched_thread_exit();
