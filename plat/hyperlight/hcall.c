@@ -39,9 +39,43 @@
 #include <hyperlight-x86/outb.h>
 #include <hyperlight-x86/hcall.h>
 #include <hyperlight-x86/fb.h>
+#ifdef CONFIG_HYPERLIGHT_POLL
+#include <hyperlight-x86/poll.h>
+#include <uk/lcpu.h>
+#endif
 
 /* Maximum payload size for host calls */
 #define HCALL_MAX_PAYLOAD 65536
+
+#ifdef CONFIG_HYPERLIGHT_POLL
+/* Yield/await protocol (see hyperlight_hcall and plat/hyperlight/poll.c).
+ *
+ * When a host tool cannot answer immediately it returns the sentinel object
+ * json!({"__hl_yield__": "<token>"}) — wrapped by the host __dispatch layer
+ * as the payload {"result":{"__hl_yield__":"<token>"}}. <token> is an opaque
+ * completion handle chosen by the host that identifies THIS specific pending
+ * operation. The guest does not interpret it; it registers the parked op under
+ * the token (see the pending-op registry below) and blocks until the next host
+ * `poll`. On every poll the host passes a JSON object listing all tasks that
+ * have completed or errored:
+ *
+ *     {"<token>":{"result":<value>}, "<token2>":{"error":"<msg>"}, …}
+ *
+ * hyperlight_poll_pump() feeds it to hyperlight_hcall_deliver_batch(), which
+ * copies each token's result object verbatim into the matching parked op's
+ * response buffer and wakes it. Using a token (instead of replaying the
+ * original request) means the host is never asked to re-execute a
+ * non-idempotent operation, and distinct concurrently-parked callers are told
+ * apart by their distinct tokens rather than by request content.
+ */
+#define HCALL_YIELD_KEY      "\"__hl_yield__\""
+
+/* Opaque token size bound. Tokens are host-chosen; 512 bytes is generous for
+ * a base64/uuid/counter handle. Mirrors HYPERLIGHT_HCALL_TOKEN_MAX (hcall.h),
+ * which sizes struct hyperlight_hcall_op::token.
+ */
+#define HCALL_YIELD_TOKEN_MAX HYPERLIGHT_HCALL_TOKEN_MAX
+#endif /* CONFIG_HYPERLIGHT_POLL */
 
 /* ========================================================================
  * FlatBuffer Encoder
@@ -355,8 +389,8 @@ static int hcall_pop(__u8 *stack, __u64 stack_size,
  */
 static __u8 hcall_encode_buf[HCALL_MAX_PAYLOAD + 256];
 
-int hyperlight_hcall(const __u8 *req, __sz req_len,
-		     __u8 *resp, __sz resp_cap, __sz *resp_len)
+static int hyperlight_hcall_once(const __u8 *req, __sz req_len,
+				 __u8 *resp, __sz resp_cap, __sz *resp_len)
 {
 	struct hyperlight_peb *peb = hyperlight_get_peb();
 	__u8 *output_stack;
@@ -417,6 +451,401 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 		*resp_len = payload_len;
 
 	return 0;
+}
+
+#ifdef CONFIG_HYPERLIGHT_POLL
+/* Bounded forward search for `needle` (length nlen) within `hay` (length
+ * hlen). Returns a pointer to the first match or NULL. hay is not assumed to
+ * be NUL-terminated, so we cannot use strstr().
+ */
+static const __u8 *hcall_memmem(const __u8 *hay, __sz hlen,
+				const char *needle, __sz nlen)
+{
+	if (nlen == 0 || hlen < nlen)
+		return __NULL;
+
+	for (__sz i = 0; i + nlen <= hlen; i++) {
+		if (memcmp(hay + i, needle, nlen) == 0)
+			return hay + i;
+	}
+	return __NULL;
+}
+
+/* ------------------------------------------------------------------ *
+ * Pending-op registry.
+ *
+ * Parked host calls (yield sentinels) register their struct
+ * hyperlight_hcall_op here keyed by the op's opaque token. On each host
+ * `poll`, hyperlight_poll_pump() calls hyperlight_hcall_deliver_batch()
+ * with the JSON object of all completed/errored tasks; each matching op
+ * is resolved in place and unregistered. The list is mutated only from
+ * the (single, cooperatively-scheduled) vCPU, but a thread can be woken
+ * from the wait queue between list operations, so mutations are guarded
+ * by a brief IRQ-off critical section.
+ * ------------------------------------------------------------------ */
+static struct hyperlight_hcall_op *hl_pending_ops;
+
+/* Stable snapshot of the most recent poll batch. deliver_batch() copies the
+ * host's poll argument here (NOT into each caller's response buffer) so the
+ * result survives until the parked caller is scheduled and reads it. This
+ * matters because a caller's response buffer is typically a shared static
+ * (e.g. hostsock's rpc_resp): between the poll pump copying a result and the
+ * woken caller reading it, other cooperatively-scheduled threads may run and
+ * clobber that shared buffer. hl_batch_buf is written only by the pump (IRQs
+ * off, no concurrent writer) and read by each woken caller's poll() before it
+ * consults its response buffer, so it is stable across the wake window. It is
+ * only overwritten on the next pump, by which point every caller woken by the
+ * previous pump has already run (the pump returns to the host only once the
+ * scheduler is idle) and copied out its value.
+ */
+static __u8 hl_batch_buf[HCALL_MAX_PAYLOAD];
+static __sz hl_batch_len;
+
+static void hcall_registry_add(struct hyperlight_hcall_op *op)
+{
+	unsigned long flags = uk_lcpu_save_irqf();
+
+	op->next = hl_pending_ops;
+	hl_pending_ops = op;
+
+	uk_lcpu_restore_irqf(flags);
+}
+
+/* Remove @op from the registry if present. Idempotent: a no-op when @op
+ * was already delivered/removed (so callers can unregister defensively).
+ */
+static void hcall_registry_del(struct hyperlight_hcall_op *op)
+{
+	struct hyperlight_hcall_op **pp;
+	unsigned long flags = uk_lcpu_save_irqf();
+
+	for (pp = &hl_pending_ops; *pp; pp = &(*pp)->next) {
+		if (*pp == op) {
+			*pp = op->next;
+			op->next = __NULL;
+			break;
+		}
+	}
+
+	uk_lcpu_restore_irqf(flags);
+}
+
+/* Classify `resp` as a yield sentinel and, if so, copy its opaque completion
+ * token into `tok`.
+ *
+ * Returns:
+ *    1  yield sentinel; token copied to `tok`/`tok_len`.
+ *    0  not a yield sentinel (real result, or malformed/absent key) — the
+ *       payload should be handed back to the caller unchanged.
+ *   -1  yield sentinel but the token does not fit in `tok_cap`.
+ *
+ * Recognises the wrapped payload {"result":{"__hl_yield__":"<token>"}} (and
+ * any payload merely containing the "__hl_yield__" key). The token value is
+ * an opaque JSON string; by contract it contains no characters requiring JSON
+ * escaping (no '"' and no '\\'), so it is copied verbatim up to the closing
+ * quote.
+ */
+static int hcall_extract_yield_token(const __u8 *resp, __sz len,
+				     __u8 *tok, __sz tok_cap, __sz *tok_len)
+{
+	const __u8 *p = hcall_memmem(resp, len, HCALL_YIELD_KEY,
+				     sizeof(HCALL_YIELD_KEY) - 1);
+	const __u8 *end = resp + len;
+	__sz n = 0;
+
+	if (!p)
+		return 0;
+
+	/* Advance past the key, then whitespace, ':', whitespace, opening '"'. */
+	p += sizeof(HCALL_YIELD_KEY) - 1;
+	while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+		p++;
+	if (p >= end || *p != ':')
+		return 0;
+	p++;
+	while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+		p++;
+	if (p >= end || *p != '"')
+		return 0;
+	p++;
+
+	/* Copy token bytes up to the closing quote. */
+	while (p < end && *p != '"') {
+		if (n >= tok_cap)
+			return -1; /* yield, but token too large to poll */
+		tok[n++] = *p++;
+	}
+	if (p >= end) /* unterminated string */
+		return 0;
+
+	*tok_len = n;
+	return 1;
+}
+
+/* Locate the value object for the key "<tok>" in the batch object
+ * {"<token>":{…}, …}. On success sets *out/*out_len to the balanced {…}
+ * value (verbatim, ready to hand back as the op's response) and returns 1;
+ * returns 0 if the token key is absent or the value is malformed.
+ *
+ * Tokens are opaque strings without embedded '"' or '\\' (see hcall.h), so
+ * the key is matched as a quoted literal; the surrounding quotes make the
+ * match immune to one token being a prefix of another. The value scan
+ * honours JSON strings and escapes so braces inside string values don't
+ * throw off the brace-depth counter.
+ */
+static int hcall_batch_find(const __u8 *json, __sz json_len,
+			    const __u8 *tok, __sz tok_len,
+			    const __u8 **out, __sz *out_len)
+{
+	const __u8 *end = json + json_len;
+	const __u8 *p = json;
+
+	while (p < end) {
+		const __u8 *q;
+		const __u8 *v;
+		int depth;
+		int instr;
+
+		if (*p != '"') {
+			p++;
+			continue;
+		}
+		/* Need `"` + tok + `"` to fit before end. */
+		if ((__sz)(end - (p + 1)) < tok_len + 1) {
+			p++;
+			continue;
+		}
+		if (memcmp(p + 1, tok, tok_len) != 0 ||
+		    p[1 + tok_len] != '"') {
+			p++;
+			continue;
+		}
+
+		/* Matched key "<tok>"; expect ws ':' ws '{'. */
+		q = p + 1 + tok_len + 1;
+		while (q < end && (*q == ' ' || *q == '\t' ||
+				   *q == '\n' || *q == '\r'))
+			q++;
+		if (q >= end || *q != ':') {
+			p++;
+			continue;
+		}
+		q++;
+		while (q < end && (*q == ' ' || *q == '\t' ||
+				   *q == '\n' || *q == '\r'))
+			q++;
+		if (q >= end || *q != '{')
+			return 0;
+
+		/* Scan a balanced object, honouring strings/escapes. */
+		v = q;
+		depth = 0;
+		instr = 0;
+		while (q < end) {
+			__u8 c = *q;
+
+			if (instr) {
+				if (c == '\\') {
+					q += 2;
+					continue;
+				}
+				if (c == '"')
+					instr = 0;
+				q++;
+				continue;
+			}
+			if (c == '"') {
+				instr = 1;
+				q++;
+				continue;
+			}
+			if (c == '{') {
+				depth++;
+			} else if (c == '}') {
+				depth--;
+				if (depth == 0) {
+					q++;
+					*out = v;
+					*out_len = (__sz)(q - v);
+					return 1;
+				}
+			}
+			q++;
+		}
+		return 0; /* unterminated value */
+	}
+	return 0;
+}
+
+void hyperlight_hcall_deliver_batch(const __u8 *json, __sz json_len)
+{
+	struct hyperlight_hcall_op *op;
+	struct hyperlight_hcall_op *next;
+
+	if (!json || json_len == 0)
+		return;
+
+	/* Snapshot the batch into the stable kernel buffer. Each woken caller
+	 * re-scans this (in hyperlight_hcall_poll) for its own token and copies
+	 * the value into its response buffer on its own thread, right before it
+	 * reads that buffer — avoiding the shared-response-buffer clobber window
+	 * (see hl_batch_buf).
+	 */
+	if (json_len > sizeof(hl_batch_buf))
+		json_len = sizeof(hl_batch_buf);
+	memcpy(hl_batch_buf, json, json_len);
+	hl_batch_len = json_len;
+
+	/* Mark every registered PENDING op whose token is in the batch READY
+	 * and unregister it; the value copy is deferred to poll(). The list is
+	 * only grown by not-yet-parked threads and we run with the woken threads
+	 * still blocked, so walking it here is safe.
+	 */
+	for (op = hl_pending_ops; op; op = next) {
+		const __u8 *val;
+		__sz val_len;
+
+		next = op->next;
+
+		if (op->state != HYPERLIGHT_HCALL_PENDING || op->token_len == 0)
+			continue;
+		if (!hcall_batch_find(hl_batch_buf, hl_batch_len, op->token,
+				      op->token_len, &val, &val_len))
+			continue;
+		op->state = HYPERLIGHT_HCALL_READY;
+		hcall_registry_del(op);
+	}
+}
+
+int hyperlight_hcall_submit(struct hyperlight_hcall_op *op,
+			    const __u8 *req, __sz req_len,
+			    __u8 *resp, __sz resp_cap)
+{
+	__sz got = 0;
+	int rc, y;
+
+	UK_ASSERT(op);
+
+	op->resp = resp;
+	op->resp_cap = resp_cap;
+	op->resp_len = 0;
+	op->token_len = 0;
+	op->next = __NULL;
+	op->state = HYPERLIGHT_HCALL_READY;
+
+	rc = hyperlight_hcall_once(req, req_len, resp, resp_cap, &got);
+	if (rc < 0)
+		return rc;
+	op->resp_len = got;
+
+	/* Classify the response: a real result leaves the op READY; a yield
+	 * sentinel captures the token, marks the op PENDING and registers it
+	 * so the next poll's deliver_batch can resolve it. A token too large
+	 * to poll (y < 0) is PENDING with token_len == 0 and is NOT registered
+	 * (it can never be matched); a later poll returns -8, while an
+	 * unparkable caller still gets the raw sentinel back in @resp.
+	 */
+	y = hcall_extract_yield_token(resp, got, op->token,
+				      sizeof(op->token), &op->token_len);
+	if (y == 1) {
+		op->state = HYPERLIGHT_HCALL_PENDING;
+		hcall_registry_add(op);
+	} else if (y < 0) {
+		op->state = HYPERLIGHT_HCALL_PENDING;
+		op->token_len = 0;
+	}
+	return 0;
+}
+
+int hyperlight_hcall_poll(struct hyperlight_hcall_op *op)
+{
+	UK_ASSERT(op);
+
+	/* Completion is signalled out-of-band by hyperlight_hcall_deliver_batch
+	 * (from the poll pump), which marks the op READY. The value itself is
+	 * copied here, on the caller's own thread, so that the window between
+	 * this copy and the caller consuming op->resp contains no cooperative
+	 * yield — a shared response buffer therefore cannot be clobbered by
+	 * another thread in between (see hl_batch_buf).
+	 */
+	if (op->state == HYPERLIGHT_HCALL_READY) {
+		const __u8 *val;
+		__sz val_len;
+
+		if (op->token_len &&
+		    hcall_batch_find(hl_batch_buf, hl_batch_len, op->token,
+				     op->token_len, &val, &val_len)) {
+			if (val_len > op->resp_cap)
+				val_len = op->resp_cap; /* truncate defensively */
+			memcpy(op->resp, val, val_len);
+			op->resp_len = val_len;
+		}
+		return 1;
+	}
+	if (op->token_len == 0)
+		return -8; /* pending but token too large to poll */
+	return 0;	   /* still pending */
+}
+#endif /* CONFIG_HYPERLIGHT_POLL */
+
+int hyperlight_hcall(const __u8 *req, __sz req_len,
+		     __u8 *resp, __sz resp_cap, __sz *resp_len)
+{
+#ifdef CONFIG_HYPERLIGHT_POLL
+	struct hyperlight_hcall_op op;
+	int rc = hyperlight_hcall_submit(&op, req, req_len, resp, resp_cap);
+
+	if (rc < 0)
+		return rc;
+
+	/* Await loop. While the host reports the operation is still pending —
+	 * a yield sentinel carrying an opaque completion token — park until the
+	 * next host `poll`. Each poll pump delivers all completed/errored task
+	 * results via hyperlight_hcall_deliver_batch(), which resolves this op
+	 * in place if its token is among them; the state check below then sees
+	 * READY. The caller's stack is preserved across the VM exit, so on
+	 * resume execution continues exactly where it left off. Outside a poll
+	 * pump (or on the pump host thread) we cannot park, so the sentinel is
+	 * returned to the caller as-is.
+	 *
+	 * This is the single-await specialisation of the submit/poll primitives
+	 * above; multi-await callers (e.g. a kernel epoll backend) submit several
+	 * ops and poll each across successive host `poll`s instead.
+	 */
+	while (op.state == HYPERLIGHT_HCALL_PENDING &&
+	       hyperlight_hcall_can_yield()) {
+		if (op.token_len == 0) {
+			hcall_registry_del(&op);
+			return -8; /* yield, token too large to poll */
+		}
+
+		hyperlight_hcall_park_retry();
+
+		rc = hyperlight_hcall_poll(&op);
+		if (rc < 0) {
+			hcall_registry_del(&op);
+			return rc;
+		}
+	}
+
+	/* Defensively unregister: covers the unparkable path (op still PENDING
+	 * but we're returning the raw sentinel) so the registry never retains a
+	 * pointer to this about-to-be-freed on-stack op. Idempotent when the op
+	 * was already delivered/removed.
+	 */
+	hcall_registry_del(&op);
+
+	if (resp_len)
+		*resp_len = op.resp_len;
+	return 0;
+#else /* !CONFIG_HYPERLIGHT_POLL */
+	__sz got = 0;
+	int rc = hyperlight_hcall_once(req, req_len, resp, resp_cap, &got);
+
+	if (resp_len)
+		*resp_len = got;
+	return rc;
+#endif /* CONFIG_HYPERLIGHT_POLL */
 }
 
 /* ========================================================================

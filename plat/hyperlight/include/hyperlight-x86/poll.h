@@ -69,6 +69,30 @@ void hyperlight_poll_idle_return(struct uk_sched *s, __nsec wakeup_time);
  */
 int hyperlight_poll_active(void);
 
+/**
+ * @return Non-zero if the caller can be parked and later resumed by a poll
+ *         pump — i.e. a pump is in flight and the caller is a schedulable
+ *         thread other than the pump's own host thread. Used by
+ *         hyperlight_hcall() to decide whether a "yield" host response can
+ *         be honoured by suspending the caller (see
+ *         hyperlight_hcall_park_retry).
+ */
+int hyperlight_hcall_can_yield(void);
+
+/**
+ * Park the calling thread until the next poll pump, then return.
+ *
+ * Used by hyperlight_hcall() when a host function call reports that its
+ * result is not ready ("yield"). The caller's stack (deep inside whatever
+ * issued the host call) is preserved by the scheduler, so when the host
+ * re-invokes `poll` and the pump wakes this thread, execution resumes right
+ * where it parked and the caller re-issues the host call to fetch the
+ * now-maybe-ready result.
+ *
+ * Must only be called when hyperlight_hcall_can_yield() is true.
+ */
+void hyperlight_hcall_park_retry(void);
+
 #ifdef __cplusplus
 }
 #endif

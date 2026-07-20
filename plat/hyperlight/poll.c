@@ -20,8 +20,11 @@
 #include <uk/thread.h>
 #include <uk/sched.h>
 #include <uk/sched_impl.h>
+#include <uk/wait.h>
 #include <hyperlight-x86/hcall.h>
 #include <hyperlight-x86/poll.h>
+#include <hyperlight-x86/dispatch.h>
+#include <hyperlight-x86/fb.h>
 
 #ifdef CONFIG_LIBHOSTSOCK
 /* Re-poll all host-proxied sockets and post readiness events, waking any
@@ -47,9 +50,112 @@ static volatile int hl_poll_in_flight;
  */
 static volatile __nsec hl_poll_wakeup_time;
 
+/* Threads parked by hyperlight_hcall_park_retry() waiting to re-issue a host
+ * call whose result was reported as not-yet-ready ("yield"). They are woken
+ * once at the start of every poll pump, giving each parked caller exactly one
+ * retry attempt per host `poll` invocation.
+ */
+static DEFINE_WAIT_QUEUE(hl_hcall_retry_wq);
+
 int hyperlight_poll_active(void)
 {
 	return hl_poll_in_flight;
+}
+
+/* Extract the first hlstring parameter from the in-flight `poll` FunctionCall
+ * and deliver it as the completed/errored-task batch to any parked host calls.
+ *
+ * The host invokes the guest `poll` function with a single JSON string
+ * argument: {"<token>":{"result":…}|{"error":…}, …} listing every async host
+ * task that has completed or errored since the last poll (empty object when
+ * none). hyperlight_hcall_deliver_batch() routes each entry to the matching
+ * parked op. The FC bytes are the ones dispatch.c stashed for this call
+ * (see hyperlight_dispatch_current_fc_*); parsing mirrors the fixed
+ * FunctionCall/hlstring FlatBuffer shape used elsewhere (fb.h).
+ */
+static void hyperlight_poll_deliver_arg(void)
+{
+	const __u8 *b = hyperlight_dispatch_current_fc_bytes();
+	__sz len = hyperlight_dispatch_current_fc_len();
+	__sz fc, params, p0_pos, p0, hs, s;
+	__u16 tf;
+	__u32 slen;
+
+	if (!b || len < 8)
+		return;
+
+	/* Root table (size-prefixed buffer: root offset at byte 4). */
+	fc = 4 + hl_fb_u32(b, 4);
+
+	/* parameters vector at VT[6] on FunctionCall. */
+	params = hl_fb_follow(b, fc, 6);
+	if (!params || hl_fb_u32(b, params) == 0)
+		return; /* no argument — nothing to deliver */
+
+	/* First parameter element (offset stored 4 bytes past the length). */
+	p0_pos = params + 4;
+	p0 = p0_pos + hl_fb_u32(b, p0_pos);
+
+	/* Parameter.value_type (u8 inline at VT[4]) must be hlstring (7). */
+	tf = hl_fb_field(b, p0, 4);
+	if (!tf || b[p0 + tf] != HL_PV_HLSTRING)
+		return;
+
+	/* Parameter.value (VT[6]) -> hlstring table -> value (VT[4]) -> data. */
+	hs = hl_fb_follow(b, p0, 6);
+	if (!hs)
+		return;
+	s = hl_fb_follow(b, hs, 4);
+	if (!s || s + 4 > len)
+		return;
+	slen = hl_fb_u32(b, s);
+	if (s + 4 + slen > len)
+		return;
+
+	hyperlight_hcall_deliver_batch(b + s + 4, (__sz)slen);
+}
+
+int hyperlight_hcall_can_yield(void)
+{
+	struct uk_thread *current;
+
+	/* Only safe while a pump is driving the scheduler, and only for a
+	 * schedulable thread other than the pump's own host thread (parking
+	 * the host thread would deadlock the pump — it is what returns control
+	 * to the host).
+	 */
+	if (!hl_poll_in_flight)
+		return 0;
+
+	current = uk_thread_current();
+	if (!current || current == hl_poll_host_thread)
+		return 0;
+
+	return 1;
+}
+
+void hyperlight_hcall_park_retry(void)
+{
+	struct uk_thread *current = uk_thread_current();
+	unsigned long flags;
+
+	UK_ASSERT(current);
+
+	/* Enqueue on the retry wait queue and block indefinitely, mirroring
+	 * the once-wait pattern in lib/uksched (uk/wait.h). The pump wakes the
+	 * whole queue on its next entry (see hyperlight_poll_pump).
+	 */
+	_uk_waitq_lock(&hl_hcall_retry_wq, flags);
+	_uk_waitq_add(&hl_hcall_retry_wq, current);
+	_uk_waitq_block_until(current, 0);
+	_uk_waitq_unlock(&hl_hcall_retry_wq, flags);
+
+	uk_sched_yield();
+
+	/* Woken by the next poll pump; leave the queue before retrying. */
+	_uk_waitq_lock(&hl_hcall_retry_wq, flags);
+	_uk_waitq_remove(current);
+	_uk_waitq_unlock(&hl_hcall_retry_wq, flags);
 }
 
 /* Report the next-wakeup deadline to the host via a synchronous host
@@ -124,6 +230,16 @@ void hyperlight_poll_pump(void)
 	 */
 	flags = uk_lcpu_save_irqf();
 	uk_lcpu_enable_irq();
+
+	/* A new host `poll` entry is when async host-side results may have
+	 * become ready. First deliver the batch of completed/errored task
+	 * results the host passed as this poll's argument to the matching
+	 * parked ops (marking them READY), then wake every caller parked by
+	 * hyperlight_hcall_park_retry() so each re-checks its op once this
+	 * poll. Threads whose result is still pending simply re-park below.
+	 */
+	hyperlight_poll_deliver_arg();
+	uk_waitq_wake_up(&hl_hcall_retry_wq);
 
 #ifdef CONFIG_LIBHOSTSOCK
 	/* A host `poll` re-entry is our chance to observe socket I/O that
