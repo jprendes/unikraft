@@ -140,7 +140,7 @@ void time_block_until(__snsec until)
 	 * next wakeup deadline. Looping on __hl_sleep here instead keeps the
 	 * vCPU inside this same host `poll` call — __hl_sleep is a *nested*
 	 * hostcall that resumes the guest in place — so the host-side
-	 * `poll_step` never returns and checkpoint/restore stalls (the host
+	 * host `poll` never returns and checkpoint/restore stalls (the host
 	 * eventually kills the vCPU to break out).
 	 *
 	 * This parks on a pure timer. Readiness delivered through a pollq

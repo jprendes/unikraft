@@ -66,7 +66,7 @@ int hyperlight_poll_active(void)
  * and deliver it as the completed/errored-task batch to any parked host calls.
  *
  * The host invokes the guest `poll` function with a single JSON string
- * argument: {"<token>":{"result":…}|{"error":…}, …} listing every async host
+ * argument: {"<request-id>":{"result":…}|{"error":…}, …} listing every async host
  * task that has completed or errored since the last poll (empty object when
  * none). hyperlight_hcall_deliver_batch() routes each entry to the matching
  * parked op. The FC bytes are the ones dispatch.c stashed for this call

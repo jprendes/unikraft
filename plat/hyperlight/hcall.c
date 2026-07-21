@@ -50,31 +50,29 @@
 #ifdef CONFIG_HYPERLIGHT_POLL
 /* Yield/await protocol (see hyperlight_hcall and plat/hyperlight/poll.c).
  *
- * When a host tool cannot answer immediately it returns the sentinel object
- * json!({"__hl_yield__": "<token>"}) — wrapped by the host __dispatch layer
- * as the payload {"result":{"__hl_yield__":"<token>"}}. <token> is an opaque
- * completion handle chosen by the host that identifies THIS specific pending
- * operation. The guest does not interpret it; it registers the parked op under
- * the token (see the pending-op registry below) and blocks until the next host
- * `poll`. On every poll the host passes a JSON object listing all tasks that
- * have completed or errored:
+ * Every request is wrapped by the guest before sending:
+ *   {"__hl_request_id":<u64>,"request":<original request>}
+ * <u64> is a guest-allocated monotonically incrementing nonzero ID stored in
+ * static guest memory (preserved across snapshots).
  *
- *     {"<token>":{"result":<value>}, "<token2>":{"error":"<msg>"}, …}
+ * When the host cannot answer immediately it returns the numeric sentinel:
+ *   {"result":{"__hl_yield__":<u64>}}
+ * where <u64> echoes the request ID. The guest validates the echoed ID against
+ * the allocated one (a mismatch is a protocol error -8), marks the op PENDING,
+ * and parks until the next host `poll`. On every poll the host passes a JSON
+ * object keyed by decimal ID strings listing completed/errored tasks:
+ *   {"42":{"result":<value>}, "7":{"error":"<msg>"}, …}
  *
  * hyperlight_poll_pump() feeds it to hyperlight_hcall_deliver_batch(), which
- * copies each token's result object verbatim into the matching parked op's
- * response buffer and wakes it. Using a token (instead of replaying the
- * original request) means the host is never asked to re-execute a
- * non-idempotent operation, and distinct concurrently-parked callers are told
- * apart by their distinct tokens rather than by request content.
+ * resolves each matching parked op in place and wakes it.
  */
 #define HCALL_YIELD_KEY      "\"__hl_yield__\""
 
-/* Opaque token size bound. Tokens are host-chosen; 512 bytes is generous for
- * a base64/uuid/counter handle. Mirrors HYPERLIGHT_HCALL_TOKEN_MAX (hcall.h),
- * which sizes struct hyperlight_hcall_op::token.
+/* JSON overhead for the request wrapper:
+ *   {"__hl_request_id":<20-digit u64>,"request":} = 52 bytes max.
+ * Round up to 64 for headroom.
  */
-#define HCALL_YIELD_TOKEN_MAX HYPERLIGHT_HCALL_TOKEN_MAX
+#define HCALL_WRAP_OVERHEAD  64
 #endif /* CONFIG_HYPERLIGHT_POLL */
 
 /* ========================================================================
@@ -474,9 +472,9 @@ static const __u8 *hcall_memmem(const __u8 *hay, __sz hlen,
 /* ------------------------------------------------------------------ *
  * Pending-op registry.
  *
- * Parked host calls (yield sentinels) register their struct
- * hyperlight_hcall_op here keyed by the op's opaque token. On each host
- * `poll`, hyperlight_poll_pump() calls hyperlight_hcall_deliver_batch()
+ * Parked host calls register their struct hyperlight_hcall_op here
+ * keyed by the op's guest-allocated request_id (nonzero u64). On each
+ * host `poll`, hyperlight_poll_pump() calls hyperlight_hcall_deliver_batch()
  * with the JSON object of all completed/errored tasks; each matching op
  * is resolved in place and unregistered. The list is mutated only from
  * the (single, cooperatively-scheduled) vCPU, but a thread can be woken
@@ -484,6 +482,22 @@ static const __u8 *hcall_memmem(const __u8 *hay, __sz hlen,
  * by a brief IRQ-off critical section.
  * ------------------------------------------------------------------ */
 static struct hyperlight_hcall_op *hl_pending_ops;
+
+/* Monotonically increasing, nonzero request-ID counter, stored in static
+ * guest memory (preserved across snapshots). Skips 0 on wrap.
+ */
+static __u64 hl_next_request_id = 1;
+
+/* Wrapping buffer for {"__hl_request_id":<id>,"request":<req>}.
+ *
+ * Shared static, like hcall_encode_buf: it is filled and consumed within a
+ * single hyperlight_hcall_submit() call with no intervening cooperative yield
+ * (hyperlight_hcall_once() only encodes, pushes and triggers the VM exit — it
+ * never parks), so the "one dispatch at a time" invariant that guards
+ * hcall_encode_buf covers this buffer too. Back-to-back multi-await submits run
+ * sequentially on the vCPU and cannot interleave mid-wrap.
+ */
+static __u8 hl_wrap_buf[HCALL_MAX_PAYLOAD + HCALL_WRAP_OVERHEAD];
 
 /* Stable snapshot of the most recent poll batch. deliver_batch() copies the
  * host's poll argument here (NOT into each caller's response buffer) so the
@@ -530,68 +544,180 @@ static void hcall_registry_del(struct hyperlight_hcall_op *op)
 	uk_lcpu_restore_irqf(flags);
 }
 
-/* Classify `resp` as a yield sentinel and, if so, copy its opaque completion
- * token into `tok`.
+/* Convert a nonzero u64 to its decimal ASCII representation (no NUL).
+ * Returns the number of digits written into buf, or 0 if buf is too small.
+ * buf must be at least 20 bytes for the worst-case 20-digit u64.
+ */
+static __sz u64_to_decimal(__u64 v, char *buf, __sz buf_sz)
+{
+	char tmp[20];
+	__sz n = 0;
+
+	if (v == 0) {
+		if (buf_sz < 1)
+			return 0;
+		buf[0] = '0';
+		return 1;
+	}
+	while (v > 0 && n < sizeof(tmp)) {
+		tmp[n++] = (char)('0' + (int)(v % 10));
+		v /= 10;
+	}
+	if (n > buf_sz)
+		return 0;
+	for (__sz i = 0; i < n; i++)
+		buf[i] = tmp[n - 1 - i];
+	return n;
+}
+
+/* Return 1 if @id is already registered in the pending-op list, 0 otherwise.
+ * Callers must hold the registry IRQ-off critical section (see hcall_alloc_id)
+ * so the walk sees a stable list.
+ */
+static int hcall_id_in_use(__u64 id)
+{
+	struct hyperlight_hcall_op *op;
+
+	for (op = hl_pending_ops; op; op = op->next)
+		if (op->request_id == id)
+			return 1;
+	return 0;
+}
+
+/* Allocate the next available nonzero monotone request ID.
+ *
+ * Advances hl_next_request_id, skipping 0 on wrap, and retries up to 64
+ * times if the candidate ID is already live in the pending-op registry (can
+ * only happen after a full 2^64 wrap cycle). Returns 0 when all 64 candidates
+ * are in use, which is treated as exhaustion (-9) by the caller.
+ *
+ * The counter bump and registry scan run in a single IRQ-off critical section,
+ * matching hcall_registry_add()/del(). The cooperative single-vCPU scheduler
+ * cannot switch callers between allocation and registration because that path
+ * contains no scheduler yield.
+ */
+static __u64 hcall_alloc_id(void)
+{
+	unsigned long flags = uk_lcpu_save_irqf();
+	__u64 result = 0;
+	int tries;
+
+	for (tries = 0; tries < 64; tries++) {
+		__u64 id = hl_next_request_id++;
+
+		if (hl_next_request_id == 0)
+			hl_next_request_id = 1; /* skip 0 on wrap */
+		if (!hcall_id_in_use(id)) {
+			result = id;
+			break;
+		}
+	}
+
+	uk_lcpu_restore_irqf(flags);
+	return result; /* 0 == exhausted */
+}
+
+/* Build the wrapped request in hl_wrap_buf:
+ *   {"__hl_request_id":<id>,"request":<req>}
+ * Returns the total byte count, or 0 if the result does not fit.
+ */
+static __sz hcall_wrap_request(__u64 id, const __u8 *req, __sz req_len)
+{
+	static const char pfx[] = "{\"__hl_request_id\":";
+	static const char mid[] = ",\"request\":";
+	char id_str[20];
+	__sz id_len = u64_to_decimal(id, id_str, sizeof(id_str));
+	__sz total;
+
+	if (id_len == 0)
+		return 0;
+	/* pfx + id + mid + req + '}' */
+	total = (sizeof(pfx) - 1) + id_len + (sizeof(mid) - 1) + req_len + 1;
+	if (total > sizeof(hl_wrap_buf))
+		return 0;
+
+	__sz pos = 0;
+
+	memcpy(hl_wrap_buf + pos, pfx, sizeof(pfx) - 1);
+	pos += sizeof(pfx) - 1;
+	memcpy(hl_wrap_buf + pos, id_str, id_len);
+	pos += id_len;
+	memcpy(hl_wrap_buf + pos, mid, sizeof(mid) - 1);
+	pos += sizeof(mid) - 1;
+	if (req_len > 0)
+		memcpy(hl_wrap_buf + pos, req, req_len);
+	pos += req_len;
+	hl_wrap_buf[pos++] = '}';
+	return pos;
+}
+
+/* Classify `resp` as a numeric yield sentinel and extract the ID.
  *
  * Returns:
- *    1  yield sentinel; token copied to `tok`/`tok_len`.
- *    0  not a yield sentinel (real result, or malformed/absent key) — the
- *       payload should be handed back to the caller unchanged.
- *   -1  yield sentinel but the token does not fit in `tok_cap`.
+ *    1  yield sentinel; *out_id set to the nonzero u64 numeric value.
+ *    0  not a yield sentinel (no "__hl_yield__" key present).
+ *   -1  "__hl_yield__" key present but value is not a valid nonzero u64
+ *       (wrong type, malformed, zero, or overflow) — protocol error.
  *
- * Recognises the wrapped payload {"result":{"__hl_yield__":"<token>"}} (and
- * any payload merely containing the "__hl_yield__" key). The token value is
- * an opaque JSON string; by contract it contains no characters requiring JSON
- * escaping (no '"' and no '\\'), so it is copied verbatim up to the closing
- * quote.
+ * Recognises {"result":{"__hl_yield__":<u64>}} and any payload containing
+ * the key. The value must be a bare integer (no quotes).
  */
-static int hcall_extract_yield_token(const __u8 *resp, __sz len,
-				     __u8 *tok, __sz tok_cap, __sz *tok_len)
+static int hcall_extract_yield_id(const __u8 *resp, __sz len, __u64 *out_id)
 {
 	const __u8 *p = hcall_memmem(resp, len, HCALL_YIELD_KEY,
 				     sizeof(HCALL_YIELD_KEY) - 1);
 	const __u8 *end = resp + len;
-	__sz n = 0;
+	__u64 v;
 
 	if (!p)
 		return 0;
 
-	/* Advance past the key, then whitespace, ':', whitespace, opening '"'. */
+	/* Advance past the key, then whitespace and ':'. */
 	p += sizeof(HCALL_YIELD_KEY) - 1;
 	while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
 		p++;
 	if (p >= end || *p != ':')
-		return 0;
+		return -1;
 	p++;
 	while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
 		p++;
-	if (p >= end || *p != '"')
-		return 0;
-	p++;
 
-	/* Copy token bytes up to the closing quote. */
-	while (p < end && *p != '"') {
-		if (n >= tok_cap)
-			return -1; /* yield, but token too large to poll */
-		tok[n++] = *p++;
+	/* Value must be a decimal integer (bare, no quotes). */
+	if (p >= end || *p < '0' || *p > '9')
+		return -1;
+
+	v = 0;
+	while (p < end && *p >= '0' && *p <= '9') {
+		__u64 d = (__u64)(*p++ - '0');
+		/* Overflow check */
+		if (v > ((__u64)-1 / 10) ||
+		    (v == ((__u64)-1 / 10) && d > ((__u64)-1 % 10)))
+			return -1;
+		v = v * 10 + d;
 	}
-	if (p >= end) /* unterminated string */
-		return 0;
-
-	*tok_len = n;
+	/* The number must be terminated by a JSON delimiter (whitespace, ',',
+	 * '}', or end of buffer). Reject trailing junk such as "42x" or a
+	 * fractional/exponent form ("4.2", "4e2") that would otherwise be
+	 * silently truncated to a bogus ID.
+	 */
+	if (p < end && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' &&
+	    *p != ',' && *p != '}')
+		return -1;
+	if (v == 0)
+		return -1; /* ID must be nonzero */
+	*out_id = v;
 	return 1;
 }
 
-/* Locate the value object for the key "<tok>" in the batch object
- * {"<token>":{…}, …}. On success sets *out/*out_len to the balanced {…}
+/* Locate the value object for the decimal key "<id_str>" in the batch object
+ * {"<decimal-id>":{…}, …}. On success sets *out/*out_len to the balanced {…}
  * value (verbatim, ready to hand back as the op's response) and returns 1;
- * returns 0 if the token key is absent or the value is malformed.
+ * returns 0 if the key is absent or the value is malformed.
  *
- * Tokens are opaque strings without embedded '"' or '\\' (see hcall.h), so
- * the key is matched as a quoted literal; the surrounding quotes make the
- * match immune to one token being a prefix of another. The value scan
- * honours JSON strings and escapes so braces inside string values don't
- * throw off the brace-depth counter.
+ * Keys are decimal string representations of u64 request IDs; the surrounding
+ * quotes make the match immune to one ID string being a prefix of another. The
+ * value scan honours JSON strings and escapes so braces inside string values
+ * don't throw off the brace-depth counter.
  */
 static int hcall_batch_find(const __u8 *json, __sz json_len,
 			    const __u8 *tok, __sz tok_len,
@@ -686,31 +812,37 @@ void hyperlight_hcall_deliver_batch(const __u8 *json, __sz json_len)
 		return;
 
 	/* Snapshot the batch into the stable kernel buffer. Each woken caller
-	 * re-scans this (in hyperlight_hcall_poll) for its own token and copies
-	 * the value into its response buffer on its own thread, right before it
-	 * reads that buffer — avoiding the shared-response-buffer clobber window
-	 * (see hl_batch_buf).
+	 * re-scans this (in hyperlight_hcall_poll) for its own request_id and
+	 * copies the value into its response buffer on its own thread, right
+	 * before it reads that buffer — avoiding the shared-response-buffer
+	 * clobber window (see hl_batch_buf).
 	 */
 	if (json_len > sizeof(hl_batch_buf))
 		json_len = sizeof(hl_batch_buf);
 	memcpy(hl_batch_buf, json, json_len);
 	hl_batch_len = json_len;
 
-	/* Mark every registered PENDING op whose token is in the batch READY
-	 * and unregister it; the value copy is deferred to poll(). The list is
-	 * only grown by not-yet-parked threads and we run with the woken threads
-	 * still blocked, so walking it here is safe.
+	/* Mark every registered PENDING op whose decimal ID key is in the
+	 * batch READY and unregister it; the value copy is deferred to poll().
+	 * The list is only grown by not-yet-parked threads and we run with the
+	 * woken threads still blocked, so walking it here is safe.
 	 */
 	for (op = hl_pending_ops; op; op = next) {
+		char id_str[20];
+		__sz id_len;
 		const __u8 *val;
 		__sz val_len;
 
 		next = op->next;
 
-		if (op->state != HYPERLIGHT_HCALL_PENDING || op->token_len == 0)
+		if (op->state != HYPERLIGHT_HCALL_PENDING || !op->request_id)
 			continue;
-		if (!hcall_batch_find(hl_batch_buf, hl_batch_len, op->token,
-				      op->token_len, &val, &val_len))
+		id_len = u64_to_decimal(op->request_id, id_str, sizeof(id_str));
+		if (!id_len)
+			continue;
+		if (!hcall_batch_find(hl_batch_buf, hl_batch_len,
+				      (const __u8 *)id_str, id_len,
+				      &val, &val_len))
 			continue;
 		op->state = HYPERLIGHT_HCALL_READY;
 		hcall_registry_del(op);
@@ -721,7 +853,10 @@ int hyperlight_hcall_submit(struct hyperlight_hcall_op *op,
 			    const __u8 *req, __sz req_len,
 			    __u8 *resp, __sz resp_cap)
 {
+	__u64 id;
+	__sz wrap_len;
 	__sz got = 0;
+	__u64 yield_id;
 	int rc, y;
 
 	UK_ASSERT(op);
@@ -729,31 +864,38 @@ int hyperlight_hcall_submit(struct hyperlight_hcall_op *op,
 	op->resp = resp;
 	op->resp_cap = resp_cap;
 	op->resp_len = 0;
-	op->token_len = 0;
+	op->request_id = 0;
 	op->next = __NULL;
 	op->state = HYPERLIGHT_HCALL_READY;
 
-	rc = hyperlight_hcall_once(req, req_len, resp, resp_cap, &got);
+	/* Allocate a nonzero request ID, collision-free with active ops. */
+	id = hcall_alloc_id();
+	if (!id)
+		return -9; /* ID space exhausted */
+
+	/* Wrap: {"__hl_request_id":<id>,"request":<req>} */
+	wrap_len = hcall_wrap_request(id, req, req_len);
+	if (!wrap_len)
+		return -3; /* request too large to wrap */
+
+	rc = hyperlight_hcall_once(hl_wrap_buf, wrap_len, resp, resp_cap, &got);
 	if (rc < 0)
 		return rc;
 	op->resp_len = got;
 
-	/* Classify the response: a real result leaves the op READY; a yield
-	 * sentinel captures the token, marks the op PENDING and registers it
-	 * so the next poll's deliver_batch can resolve it. A token too large
-	 * to poll (y < 0) is PENDING with token_len == 0 and is NOT registered
-	 * (it can never be matched); a later poll returns -8, while an
-	 * unparkable caller still gets the raw sentinel back in @resp.
+	/* Classify the response: no __hl_yield__ key → READY with real result;
+	 * valid numeric yield ID matching @id → PENDING, register for delivery;
+	 * any other case (malformed, mismatched ID) → protocol error -8.
 	 */
-	y = hcall_extract_yield_token(resp, got, op->token,
-				      sizeof(op->token), &op->token_len);
-	if (y == 1) {
-		op->state = HYPERLIGHT_HCALL_PENDING;
-		hcall_registry_add(op);
-	} else if (y < 0) {
-		op->state = HYPERLIGHT_HCALL_PENDING;
-		op->token_len = 0;
-	}
+	y = hcall_extract_yield_id(resp, got, &yield_id);
+	if (y == 0)
+		return 0; /* real result, op stays READY */
+	if (y < 0 || yield_id != id)
+		return -8; /* malformed or mismatched yield ID */
+
+	op->request_id = id;
+	op->state = HYPERLIGHT_HCALL_PENDING;
+	hcall_registry_add(op);
 	return 0;
 }
 
@@ -765,25 +907,31 @@ int hyperlight_hcall_poll(struct hyperlight_hcall_op *op)
 	 * (from the poll pump), which marks the op READY. The value itself is
 	 * copied here, on the caller's own thread, so that the window between
 	 * this copy and the caller consuming op->resp contains no cooperative
-	 * yield — a shared response buffer therefore cannot be clobbered by
-	 * another thread in between (see hl_batch_buf).
+	 * yield — a shared response buffer cannot be clobbered by another
+	 * thread in between (see hl_batch_buf).
 	 */
 	if (op->state == HYPERLIGHT_HCALL_READY) {
-		const __u8 *val;
-		__sz val_len;
+		if (op->request_id) {
+			char id_str[20];
+			__sz id_len = u64_to_decimal(op->request_id, id_str,
+						     sizeof(id_str));
+			const __u8 *val;
+			__sz val_len;
 
-		if (op->token_len &&
-		    hcall_batch_find(hl_batch_buf, hl_batch_len, op->token,
-				     op->token_len, &val, &val_len)) {
-			if (val_len > op->resp_cap)
-				val_len = op->resp_cap; /* truncate defensively */
-			memcpy(op->resp, val, val_len);
-			op->resp_len = val_len;
+			if (id_len &&
+			    hcall_batch_find(hl_batch_buf, hl_batch_len,
+					     (const __u8 *)id_str, id_len,
+					     &val, &val_len)) {
+				if (val_len > op->resp_cap)
+					val_len = op->resp_cap;
+				memcpy(op->resp, val, val_len);
+				op->resp_len = val_len;
+			}
 		}
 		return 1;
 	}
-	if (op->token_len == 0)
-		return -8; /* pending but token too large to poll */
+	if (!op->request_id)
+		return -8; /* pending but no valid request ID */
 	return 0;	   /* still pending */
 }
 #endif /* CONFIG_HYPERLIGHT_POLL */
@@ -799,26 +947,21 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 		return rc;
 
 	/* Await loop. While the host reports the operation is still pending —
-	 * a yield sentinel carrying an opaque completion token — park until the
-	 * next host `poll`. Each poll pump delivers all completed/errored task
-	 * results via hyperlight_hcall_deliver_batch(), which resolves this op
-	 * in place if its token is among them; the state check below then sees
-	 * READY. The caller's stack is preserved across the VM exit, so on
+	 * a numeric yield sentinel — park until the next host `poll`. Each poll
+	 * pump delivers all completed/errored task results via
+	 * hyperlight_hcall_deliver_batch(), which resolves this op in place if
+	 * its decimal request_id key is among them; the state check below then
+	 * sees READY. The caller's stack is preserved across the VM exit, so on
 	 * resume execution continues exactly where it left off. Outside a poll
-	 * pump (or on the pump host thread) we cannot park, so the sentinel is
-	 * returned to the caller as-is.
+	 * pump (or on the pump host thread) we cannot park, so the yield
+	 * sentinel is returned to the caller as-is.
 	 *
 	 * This is the single-await specialisation of the submit/poll primitives
-	 * above; multi-await callers (e.g. a kernel epoll backend) submit several
-	 * ops and poll each across successive host `poll`s instead.
+	 * above; multi-await callers submit several ops and poll each across
+	 * successive host `poll`s instead.
 	 */
 	while (op.state == HYPERLIGHT_HCALL_PENDING &&
 	       hyperlight_hcall_can_yield()) {
-		if (op.token_len == 0) {
-			hcall_registry_del(&op);
-			return -8; /* yield, token too large to poll */
-		}
-
 		hyperlight_hcall_park_retry();
 
 		rc = hyperlight_hcall_poll(&op);
