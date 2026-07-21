@@ -149,14 +149,13 @@ void time_block_until(__snsec until)
 	 * park on the relevant pollq (uk_file_poll_until) for prompt,
 	 * event-driven wakeups rather than relying on this deadline.
 	 */
-	if (hyperlight_poll_active()) {
+	if (hyperlight_poll_current_can_park()) {
 		struct uk_thread *current = uk_thread_current();
 
-		if (current) {
-			uk_thread_block_until(current, until);
-			uk_sched_yield();
-			return;
-		}
+		UK_ASSERT(current);
+		uk_thread_block_until(current, until);
+		uk_sched_yield();
+		return;
 	}
 #endif /* CONFIG_HYPERLIGHT_POLL */
 

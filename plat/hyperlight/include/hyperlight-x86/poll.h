@@ -73,11 +73,9 @@ int hyperlight_poll_active(void);
  * @return Non-zero if the caller can be parked and later resumed by a poll
  *         pump — i.e. a pump is in flight and the caller is a schedulable
  *         thread other than the pump's own host thread. Used by
- *         hyperlight_hcall() to decide whether a "yield" host response can
- *         be honoured by suspending the caller (see
- *         hyperlight_hcall_park_retry).
+ *         timer and host-call wait paths before suspending the current thread.
  */
-int hyperlight_hcall_can_yield(void);
+int hyperlight_poll_current_can_park(void);
 
 /**
  * Park the calling thread until the next poll pump, then return.
@@ -86,10 +84,9 @@ int hyperlight_hcall_can_yield(void);
  * result is not ready ("yield"). The caller's stack (deep inside whatever
  * issued the host call) is preserved by the scheduler, so when the host
  * re-invokes `poll` and the pump wakes this thread, execution resumes right
- * where it parked and the caller re-issues the host call to fetch the
- * now-maybe-ready result.
+ * where it parked and checks the completion batch delivered by the pump.
  *
- * Must only be called when hyperlight_hcall_can_yield() is true.
+ * Must only be called when hyperlight_poll_current_can_park() is true.
  */
 void hyperlight_hcall_park_retry(void);
 

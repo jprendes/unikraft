@@ -961,7 +961,7 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 	 * successive host `poll`s instead.
 	 */
 	while (op.state == HYPERLIGHT_HCALL_PENDING &&
-	       hyperlight_hcall_can_yield()) {
+	       hyperlight_poll_current_can_park()) {
 		hyperlight_hcall_park_retry();
 
 		rc = hyperlight_hcall_poll(&op);

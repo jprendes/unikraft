@@ -26,6 +26,8 @@
 #include <hyperlight-x86/dispatch.h>
 #include <hyperlight-x86/fb.h>
 
+#define HYPERLIGHT_POLL_REPOLL_NS 1ULL
+
 #ifdef CONFIG_LIBHOSTSOCK
 /* Re-poll all host-proxied sockets and post readiness events, waking any
  * thread cooperatively parked on a socket (e.g. a blocking recv/accept that
@@ -115,7 +117,7 @@ static void hyperlight_poll_deliver_arg(void)
 	hyperlight_hcall_deliver_batch(b + s + 4, (__sz)slen);
 }
 
-int hyperlight_hcall_can_yield(void)
+int hyperlight_poll_current_can_park(void)
 {
 	struct uk_thread *current;
 
@@ -164,7 +166,7 @@ void hyperlight_hcall_park_retry(void)
  * the host-side ToolRegistry).
  *
  *   ns: nanoseconds until the next timer fires (0 = no pending timer;
- *       the host waits for external input before re-polling).
+ *       1 = re-poll immediately when a real timer is already due).
  *
  * Completion is signalled separately by the application through the
  * existing __hl_exit host function, so it is not reported here. Failures
@@ -273,12 +275,16 @@ void hyperlight_poll_pump(void)
 	hl_poll_host_thread = NULL;
 	hl_poll_wakeup_time = 0;
 
-	/* Translate the absolute deadline into a relative delay for the
-	 * host. 0 means "no pending timer" (host waits for external input).
+	/* Translate the absolute deadline into a relative delay for the host.
+	 * Reserve 0 exclusively for "no pending timer." A real deadline can
+	 * become due while control switches from the idle thread back to this
+	 * pump; report the minimum nonzero delay in that case so the host
+	 * re-polls immediately instead of waiting indefinitely for external I/O.
 	 */
 	if (wakeup_time) {
 		now = ukplat_monotonic_clock();
-		ns = (wakeup_time > now) ? (__u64)(wakeup_time - now) : 0;
+		ns = (wakeup_time > now) ? (__u64)(wakeup_time - now) :
+			HYPERLIGHT_POLL_REPOLL_NS;
 	} else {
 		ns = 0;
 	}
