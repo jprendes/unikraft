@@ -59,7 +59,8 @@ void _ukplat_init_console(void)
 {
 	uk_console_init(&hyperlight_console, "Hyperlight",
 			&hyperlight_console_ops,
-			UK_CONSOLE_FLAG_STDOUT | UK_CONSOLE_FLAG_STDIN);
+			UK_CONSOLE_FLAG_STDOUT | UK_CONSOLE_FLAG_STDIN,
+			UK_CONSOLE_CLASS_HVC);
 
 	uk_console_register(&hyperlight_console);
 }
