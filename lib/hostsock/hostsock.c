@@ -37,7 +37,6 @@ extern void time_block_until(__snsec until);
 /* Per-socket driver data. */
 struct hostsock_data {
 	uint32_t host_fd;
-	int nonblock;
 };
 
 /* Static per-call buffers. Not thread-safe; callers serialise via
@@ -466,7 +465,6 @@ static uint32_t get_host_fd(posix_sock *sock)
 static void *hostsock_create(struct posix_socket_driver *d,
 			     int family, int type, int protocol)
 {
-	int nonblock = (type & SOCK_NONBLOCK) ? 1 : 0;
 	int sock_type = type & ~SOCK_FLAGS;
 	int n = build_req(
 		"{\"name\":\"net_socket\",\"args\":"
@@ -487,10 +485,9 @@ static void *hostsock_create(struct posix_socket_driver *d,
 	if (!sd)
 		return ERR2PTR(-ENOMEM);
 	sd->host_fd = (uint32_t)fd;
-	sd->nonblock = nonblock;
 
-	uk_pr_debug("hostsock: create fd=%u (family=%d type=%d nb=%d)\n",
-		    sd->host_fd, family, sock_type, nonblock);
+	uk_pr_debug("hostsock: create fd=%u (family=%d type=%d)\n",
+		    sd->host_fd, family, sock_type);
 	return sd;
 }
 
@@ -540,14 +537,10 @@ static void *hostsock_accept4(posix_sock *sock,
 	struct hostsock_data *listen_data = posix_sock_get_data(sock);
 
 	/*
-	 * Always check readiness before calling the host's blocking accept.
-	 * A blocking hcall freezes the entire VM (single vCPU), so we must
-	 * never let accept block on the host side.  Return EAGAIN and let
-	 * the Unikraft poll/epoll layer handle the wait.
-	 *
-	 * This also covers runtimes that set non-blocking mode via
-	 * fcntl(F_SETFL, O_NONBLOCK) rather than ioctl(FIONBIO) — fcntl
-	 * updates the uk_file flags but not our sd->nonblock field.
+	 * Check readiness before submitting accept. If no connection is
+	 * available, return EAGAIN; the posix-socket layer either waits via
+	 * uk_file_poll() or returns immediately according to the descriptor's
+	 * O_NONBLOCK mode.
 	 */
 	{
 		int ready = hostsock_check_ready(listen_data->host_fd, 1);
@@ -572,13 +565,11 @@ static void *hostsock_accept4(posix_sock *sock,
 	if (!sd)
 		return ERR2PTR(-ENOMEM);
 	sd->host_fd = (uint32_t)new_fd;
-	sd->nonblock = (flags & SOCK_NONBLOCK) ? 1 : 0;
 
 	if (addr && addr_len)
 		json_to_sockaddr(rpc_resp, addr, addr_len);
 
-	uk_pr_debug("hostsock: accept -> fd=%u (nb=%d)\n",
-		    sd->host_fd, sd->nonblock);
+	uk_pr_debug("hostsock: accept -> fd=%u\n", sd->host_fd);
 	return sd;
 }
 
@@ -642,17 +633,13 @@ static ssize_t hostsock_recvfrom(posix_sock *sock,
 	struct hostsock_data *sd = posix_sock_get_data(sock);
 
 	/*
-	 * Always check readiness before calling the host's blocking recv.
-	 * A blocking hcall freezes the entire VM (single vCPU), so we must
-	 * never let recv block on the host side.  Return EAGAIN and let the
-	 * Unikraft poll/epoll layer handle the wait — the posix-socket
-	 * recvfrom/recvmsg wrappers retry via uk_file_poll(), which yields
-	 * to the scheduler cooperatively (poll_step-friendly) instead of
-	 * busy-looping here.  This mirrors hostsock_accept4.
-	 *
-	 * The pre-check also covers runtimes that set non-blocking mode via
-	 * fcntl(F_SETFL, O_NONBLOCK) rather than ioctl(FIONBIO) — fcntl
-	 * updates the uk_file flags but not our sd->nonblock field.
+	 * Check readiness before submitting recv. If no data is available,
+	 * return EAGAIN so the blocking posix-socket recvfrom/recvmsg wrappers
+	 * wait via uk_file_poll() and retry, while non-blocking calls return
+	 * immediately. This integrates socket waiting with the cooperative
+	 * scheduler instead of leaving a recv host call pending. Blocking
+	 * semantics are owned by the descriptor's O_NONBLOCK mode in the
+	 * posix-socket layer. This mirrors hostsock_accept4.
 	 */
 	{
 		int ready = hostsock_check_ready(sd->host_fd, 1);
@@ -861,17 +848,6 @@ static int hostsock_close(posix_sock *sock)
 	return 0;
 }
 
-static int hostsock_ioctl(posix_sock *sock, int request, void *argp)
-{
-	/* FIONBIO = 0x5421 on Linux */
-	if (request == 0x5421 && argp) {
-		struct hostsock_data *sd = posix_sock_get_data(sock);
-		sd->nonblock = (*(int *)argp) ? 1 : 0;
-		return 0;
-	}
-	return -ENOSYS;
-}
-
 static int hostsock_socketpair(struct posix_socket_driver *d __attribute__((unused)),
 			       int family __attribute__((unused)),
 			       int type __attribute__((unused)),
@@ -935,7 +911,6 @@ static struct posix_socket_ops hostsock_ops = {
 	.read        = hostsock_read,
 	.write       = hostsock_write,
 	.close       = hostsock_close,
-	.ioctl       = hostsock_ioctl,
 	.poll_setup  = hostsock_poll_setup,
 };
 
