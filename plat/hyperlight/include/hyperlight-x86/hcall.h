@@ -28,13 +28,13 @@ extern "C" {
  * of the form {"name":"<tool>","args":{…}} that the host recognises.
  *
  * Under CONFIG_HYPERLIGHT_POLL the request is wrapped as
- * {"__hl_request_id":<u64>,"request":<original>} before sending; the u64 is
- * a guest-allocated monotonically incrementing nonzero ID (static guest
- * memory, preserved across snapshots). The host echoes the ID as a numeric
- * yield sentinel {"result":{"__hl_yield__":<u64>}} when the result is not yet
- * ready; the guest validates the returned ID matches the allocated one and
- * parks the caller until the next `poll`. The host delivers completions as a
- * batch keyed by decimal ID strings: {"42":{"result":…}|{"error":…}, …}.
+ * {"__hl_request_id":"<16 lowercase hex digits>","request":<original>} before
+ * sending; the underlying u64 is a guest-allocated monotonically incrementing
+ * nonzero ID (static guest memory, preserved across snapshots). The host echoes
+ * the string as {"result":{"__hl_yield__":"<16 lowercase hex digits>"}} when
+ * the result is not yet ready; the guest validates the returned ID matches the
+ * allocated one and parks the caller until the next `poll`. The host delivers
+ * completions in a batch keyed by the same fixed-width hex strings.
  * hyperlight_poll_pump() routes each entry to the matching parked op (see
  * hyperlight_hcall_deliver_batch), so the caller resumes with the real result
  * without replaying the request. Parking only happens when the caller is on a
@@ -55,7 +55,7 @@ extern "C" {
  *         -6 FlatBuffer decode failed,
  *         -7 response buffer too small,
  *         -8 (CONFIG_HYPERLIGHT_POLL) yield sentinel has a malformed or
- *            mismatched numeric ID — protocol error,
+ *            mismatched hexadecimal ID — protocol error,
  *         -9 (CONFIG_HYPERLIGHT_POLL) request ID allocation exhausted.
  */
 int hyperlight_hcall(const __u8 *req, __sz req_len,
@@ -97,13 +97,13 @@ struct hyperlight_hcall_op {
 /**
  * Submit a host call without blocking.
  *
- * Allocates a monotone nonzero u64 request ID, wraps the request as
- * {"__hl_request_id":<id>,"request":<req>}, and issues it once. If the host
+ * Allocates a monotone nonzero u64 request ID, encodes it as a fixed-width
+ * lowercase hex string in the request wrapper, and issues it once. If the host
  * answers immediately, @op->state is HYPERLIGHT_HCALL_READY and the result is
- * in @resp. If the host yields ({"result":{"__hl_yield__":<id>}}), the
- * returned ID is validated against the allocated one; a mismatch or malformed
- * sentinel is an explicit protocol error (-8). On a valid yield @op->state is
- * HYPERLIGHT_HCALL_PENDING and the op is registered so a later
+ * in @resp. If the host yields, its hexadecimal ID is validated against the
+ * allocated one; a mismatch or malformed sentinel is an explicit protocol
+ * error (-8). On a valid yield @op->state is HYPERLIGHT_HCALL_PENDING and the
+ * op is registered so a later
  * hyperlight_hcall_deliver_batch() can resolve it. Does NOT park, so it is
  * safe to call outside a poll pump and to submit several ops back-to-back
  * before waiting on any.
@@ -120,8 +120,8 @@ int hyperlight_hcall_submit(struct hyperlight_hcall_op *op,
  *
  * Completion is delivered out-of-band by hyperlight_hcall_deliver_batch() (from
  * the poll pump, using the JSON the host passes to the `poll` guest function),
- * which marks the op READY and copies the result into @op->resp. This function
- * merely reports the current state: the caller parks between polls (e.g. via
+ * which marks the op READY. If READY, this function copies the result from the
+ * stable batch snapshot into @op->resp. The caller parks between polls (e.g. via
  * hyperlight_hcall_park_retry()) and re-checks after each host `poll`.
  *
  * @return 1 if now READY, 0 if still PENDING, negative on failure (-8 if
@@ -133,12 +133,12 @@ int hyperlight_hcall_poll(struct hyperlight_hcall_op *op);
  * Deliver a batch of completed/errored host-call results to parked ops.
  *
  * @json is the JSON object the host passes as the `poll` guest function's
- * argument: {"<decimal-id>":{"result":…}|{"error":…}, …}. For every
- * registered PENDING op whose decimal request_id string appears as a key,
- * the corresponding value object is copied verbatim into the op's @resp
- * buffer, the op is marked READY and removed from the pending-op registry.
- * Ops whose IDs are absent stay pending. Called by hyperlight_poll_pump()
- * before it wakes parked callers.
+ * argument: {"<16-digit-hex-id>":{"result":…}|{"error":…}, …}. For every
+ * registered PENDING op whose hexadecimal request_id string appears as a key,
+ * the corresponding value object remains in a stable batch snapshot, the op is
+ * marked READY and removed from the pending-op registry. The caller later copies
+ * that value into @resp via hyperlight_hcall_poll(). Ops whose IDs are absent
+ * stay pending. Called by hyperlight_poll_pump() before it wakes parked callers.
  */
 void hyperlight_hcall_deliver_batch(const __u8 *json, __sz json_len);
 #endif /* CONFIG_HYPERLIGHT_POLL */

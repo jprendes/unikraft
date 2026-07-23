@@ -51,27 +51,29 @@
 /* Yield/await protocol (see hyperlight_hcall and plat/hyperlight/poll.c).
  *
  * Every request is wrapped by the guest before sending:
- *   {"__hl_request_id":<u64>,"request":<original request>}
- * <u64> is a guest-allocated monotonically incrementing nonzero ID stored in
- * static guest memory (preserved across snapshots).
+ *   {"__hl_request_id":"<16 lowercase hex digits>",
+ *    "request":<original request>}
+ * The ID is a guest-allocated monotonically incrementing nonzero u64 encoded
+ * as fixed-width lowercase hex and stored in static guest memory (preserved
+ * across snapshots).
  *
  * When the host cannot answer immediately it returns the numeric sentinel:
- *   {"result":{"__hl_yield__":<u64>}}
- * where <u64> echoes the request ID. The guest validates the echoed ID against
- * the allocated one (a mismatch is a protocol error -8), marks the op PENDING,
- * and parks until the next host `poll`. On every poll the host passes a JSON
- * object keyed by decimal ID strings listing completed/errored tasks:
- *   {"42":{"result":<value>}, "7":{"error":"<msg>"}, …}
+ *   {"result":{"__hl_yield__":"<16 lowercase hex digits>"}}
+ * where the string echoes the request ID. The guest validates the echoed ID
+ * against the allocated one (a mismatch is a protocol error -8), marks the op
+ * PENDING, and parks until the next host `poll`. On every poll the host passes
+ * a JSON object keyed by those hex strings listing completed/errored tasks:
+ *   {"000000000000002a":{"result":<value>}, …}
  *
  * hyperlight_poll_pump() feeds it to hyperlight_hcall_deliver_batch(), which
  * resolves each matching parked op in place and wakes it.
  */
 #define HCALL_YIELD_KEY      "\"__hl_yield__\""
 
-/* JSON overhead for the request wrapper:
- *   {"__hl_request_id":<20-digit u64>,"request":} = 52 bytes max.
- * Round up to 64 for headroom.
- */
+/* Fixed-width textual representation of a u64 request ID. */
+#define HCALL_ID_HEX_LEN      16
+
+/* JSON overhead for the request wrapper. Round up for headroom. */
 #define HCALL_WRAP_OVERHEAD  64
 #endif /* CONFIG_HYPERLIGHT_POLL */
 
@@ -544,30 +546,13 @@ static void hcall_registry_del(struct hyperlight_hcall_op *op)
 	uk_lcpu_restore_irqf(flags);
 }
 
-/* Convert a nonzero u64 to its decimal ASCII representation (no NUL).
- * Returns the number of digits written into buf, or 0 if buf is too small.
- * buf must be at least 20 bytes for the worst-case 20-digit u64.
- */
-static __sz u64_to_decimal(__u64 v, char *buf, __sz buf_sz)
+/* Encode a u64 as exactly 16 lowercase hexadecimal digits (no NUL). */
+static void hcall_id_to_hex(__u64 v, char buf[HCALL_ID_HEX_LEN])
 {
-	char tmp[20];
-	__sz n = 0;
+	static const char digits[] = "0123456789abcdef";
 
-	if (v == 0) {
-		if (buf_sz < 1)
-			return 0;
-		buf[0] = '0';
-		return 1;
-	}
-	while (v > 0 && n < sizeof(tmp)) {
-		tmp[n++] = (char)('0' + (int)(v % 10));
-		v /= 10;
-	}
-	if (n > buf_sz)
-		return 0;
-	for (__sz i = 0; i < n; i++)
-		buf[i] = tmp[n - 1 - i];
-	return n;
+	for (__sz i = 0; i < HCALL_ID_HEX_LEN; i++)
+		buf[i] = digits[(v >> ((HCALL_ID_HEX_LEN - 1 - i) * 4)) & 0xf];
 }
 
 /* Return 1 if @id is already registered in the pending-op list, 0 otherwise.
@@ -618,21 +603,20 @@ static __u64 hcall_alloc_id(void)
 }
 
 /* Build the wrapped request in hl_wrap_buf:
- *   {"__hl_request_id":<id>,"request":<req>}
+ *   {"__hl_request_id":"<fixed-width-hex-id>","request":<req>}
  * Returns the total byte count, or 0 if the result does not fit.
  */
 static __sz hcall_wrap_request(__u64 id, const __u8 *req, __sz req_len)
 {
-	static const char pfx[] = "{\"__hl_request_id\":";
-	static const char mid[] = ",\"request\":";
-	char id_str[20];
-	__sz id_len = u64_to_decimal(id, id_str, sizeof(id_str));
+	static const char pfx[] = "{\"__hl_request_id\":\"";
+	static const char mid[] = "\",\"request\":";
+	char id_str[HCALL_ID_HEX_LEN];
 	__sz total;
 
-	if (id_len == 0)
-		return 0;
+	hcall_id_to_hex(id, id_str);
 	/* pfx + id + mid + req + '}' */
-	total = (sizeof(pfx) - 1) + id_len + (sizeof(mid) - 1) + req_len + 1;
+	total = (sizeof(pfx) - 1) + HCALL_ID_HEX_LEN +
+		(sizeof(mid) - 1) + req_len + 1;
 	if (total > sizeof(hl_wrap_buf))
 		return 0;
 
@@ -640,8 +624,8 @@ static __sz hcall_wrap_request(__u64 id, const __u8 *req, __sz req_len)
 
 	memcpy(hl_wrap_buf + pos, pfx, sizeof(pfx) - 1);
 	pos += sizeof(pfx) - 1;
-	memcpy(hl_wrap_buf + pos, id_str, id_len);
-	pos += id_len;
+	memcpy(hl_wrap_buf + pos, id_str, HCALL_ID_HEX_LEN);
+	pos += HCALL_ID_HEX_LEN;
 	memcpy(hl_wrap_buf + pos, mid, sizeof(mid) - 1);
 	pos += sizeof(mid) - 1;
 	if (req_len > 0)
@@ -651,16 +635,16 @@ static __sz hcall_wrap_request(__u64 id, const __u8 *req, __sz req_len)
 	return pos;
 }
 
-/* Classify `resp` as a numeric yield sentinel and extract the ID.
+/* Classify `resp` as a fixed-width hexadecimal yield sentinel and extract ID.
  *
  * Returns:
- *    1  yield sentinel; *out_id set to the nonzero u64 numeric value.
+ *    1  yield sentinel; *out_id set to the decoded nonzero u64 value.
  *    0  not a yield sentinel (no "__hl_yield__" key present).
- *   -1  "__hl_yield__" key present but value is not a valid nonzero u64
- *       (wrong type, malformed, zero, or overflow) — protocol error.
+ *   -1  key present but value is not exactly 16 lowercase hex digits,
+ *       decodes to zero, or is otherwise malformed — protocol error.
  *
- * Recognises {"result":{"__hl_yield__":<u64>}} and any payload containing
- * the key. The value must be a bare integer (no quotes).
+ * Recognises {"result":{"__hl_yield__":"000000000000002a"}} and any payload
+ * containing the key.
  */
 static int hcall_extract_yield_id(const __u8 *resp, __sz len, __u64 *out_id)
 {
@@ -682,24 +666,25 @@ static int hcall_extract_yield_id(const __u8 *resp, __sz len, __u64 *out_id)
 	while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
 		p++;
 
-	/* Value must be a decimal integer (bare, no quotes). */
-	if (p >= end || *p < '0' || *p > '9')
+	if (p >= end || *p++ != '"' ||
+	    (__sz)(end - p) < HCALL_ID_HEX_LEN + 1)
 		return -1;
 
 	v = 0;
-	while (p < end && *p >= '0' && *p <= '9') {
-		__u64 d = (__u64)(*p++ - '0');
-		/* Overflow check */
-		if (v > ((__u64)-1 / 10) ||
-		    (v == ((__u64)-1 / 10) && d > ((__u64)-1 % 10)))
+	for (__sz i = 0; i < HCALL_ID_HEX_LEN; i++) {
+		__u8 c = *p++;
+		__u64 d;
+
+		if (c >= '0' && c <= '9')
+			d = (__u64)(c - '0');
+		else if (c >= 'a' && c <= 'f')
+			d = (__u64)(c - 'a' + 10);
+		else
 			return -1;
-		v = v * 10 + d;
+		v = (v << 4) | d;
 	}
-	/* The number must be terminated by a JSON delimiter (whitespace, ',',
-	 * '}', or end of buffer). Reject trailing junk such as "42x" or a
-	 * fractional/exponent form ("4.2", "4e2") that would otherwise be
-	 * silently truncated to a bogus ID.
-	 */
+	if (*p++ != '"')
+		return -1;
 	if (p < end && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' &&
 	    *p != ',' && *p != '}')
 		return -1;
@@ -709,15 +694,13 @@ static int hcall_extract_yield_id(const __u8 *resp, __sz len, __u64 *out_id)
 	return 1;
 }
 
-/* Locate the value object for the decimal key "<id_str>" in the batch object
- * {"<decimal-id>":{…}, …}. On success sets *out/*out_len to the balanced {…}
+/* Locate the value object for the fixed-width hex key "<id_str>" in the batch
+ * object. On success sets @out and @out_len to the balanced {...}
  * value (verbatim, ready to hand back as the op's response) and returns 1;
  * returns 0 if the key is absent or the value is malformed.
  *
- * Keys are decimal string representations of u64 request IDs; the surrounding
- * quotes make the match immune to one ID string being a prefix of another. The
- * value scan honours JSON strings and escapes so braces inside string values
- * don't throw off the brace-depth counter.
+ * The value scan honours JSON strings and escapes so braces inside string
+ * values don't throw off the brace-depth counter.
  */
 static int hcall_batch_find(const __u8 *json, __sz json_len,
 			    const __u8 *tok, __sz tok_len,
@@ -822,14 +805,13 @@ void hyperlight_hcall_deliver_batch(const __u8 *json, __sz json_len)
 	memcpy(hl_batch_buf, json, json_len);
 	hl_batch_len = json_len;
 
-	/* Mark every registered PENDING op whose decimal ID key is in the
+	/* Mark every registered PENDING op whose hexadecimal ID key is in the
 	 * batch READY and unregister it; the value copy is deferred to poll().
 	 * The list is only grown by not-yet-parked threads and we run with the
 	 * woken threads still blocked, so walking it here is safe.
 	 */
 	for (op = hl_pending_ops; op; op = next) {
-		char id_str[20];
-		__sz id_len;
+		char id_str[HCALL_ID_HEX_LEN];
 		const __u8 *val;
 		__sz val_len;
 
@@ -837,11 +819,9 @@ void hyperlight_hcall_deliver_batch(const __u8 *json, __sz json_len)
 
 		if (op->state != HYPERLIGHT_HCALL_PENDING || !op->request_id)
 			continue;
-		id_len = u64_to_decimal(op->request_id, id_str, sizeof(id_str));
-		if (!id_len)
-			continue;
+		hcall_id_to_hex(op->request_id, id_str);
 		if (!hcall_batch_find(hl_batch_buf, hl_batch_len,
-				      (const __u8 *)id_str, id_len,
+				      (const __u8 *)id_str, HCALL_ID_HEX_LEN,
 				      &val, &val_len))
 			continue;
 		op->state = HYPERLIGHT_HCALL_READY;
@@ -873,7 +853,7 @@ int hyperlight_hcall_submit(struct hyperlight_hcall_op *op,
 	if (!id)
 		return -9; /* ID space exhausted */
 
-	/* Wrap: {"__hl_request_id":<id>,"request":<req>} */
+	/* Wrap with the fixed-width hexadecimal request ID. */
 	wrap_len = hcall_wrap_request(id, req, req_len);
 	if (!wrap_len)
 		return -3; /* request too large to wrap */
@@ -884,7 +864,7 @@ int hyperlight_hcall_submit(struct hyperlight_hcall_op *op,
 	op->resp_len = got;
 
 	/* Classify the response: no __hl_yield__ key → READY with real result;
-	 * valid numeric yield ID matching @id → PENDING, register for delivery;
+	 * valid hexadecimal yield ID matching @id → PENDING, register for delivery;
 	 * any other case (malformed, mismatched ID) → protocol error -8.
 	 */
 	y = hcall_extract_yield_id(resp, got, &yield_id);
@@ -912,15 +892,14 @@ int hyperlight_hcall_poll(struct hyperlight_hcall_op *op)
 	 */
 	if (op->state == HYPERLIGHT_HCALL_READY) {
 		if (op->request_id) {
-			char id_str[20];
-			__sz id_len = u64_to_decimal(op->request_id, id_str,
-						     sizeof(id_str));
+			char id_str[HCALL_ID_HEX_LEN];
 			const __u8 *val;
 			__sz val_len;
 
-			if (id_len &&
-			    hcall_batch_find(hl_batch_buf, hl_batch_len,
-					     (const __u8 *)id_str, id_len,
+			hcall_id_to_hex(op->request_id, id_str);
+			if (hcall_batch_find(hl_batch_buf, hl_batch_len,
+					     (const __u8 *)id_str,
+					     HCALL_ID_HEX_LEN,
 					     &val, &val_len)) {
 				if (val_len > op->resp_cap)
 					val_len = op->resp_cap;
@@ -947,10 +926,10 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 		return rc;
 
 	/* Await loop. While the host reports the operation is still pending —
-	 * a numeric yield sentinel — park until the next host `poll`. Each poll
+	 * a hexadecimal yield sentinel — park until the next host `poll`. Each poll
 	 * pump delivers all completed/errored task results via
 	 * hyperlight_hcall_deliver_batch(), which resolves this op in place if
-	 * its decimal request_id key is among them; the state check below then
+	 * its hexadecimal request_id key is among them; the state check below then
 	 * sees READY. The caller's stack is preserved across the VM exit, so on
 	 * resume execution continues exactly where it left off. Outside a poll
 	 * pump (or on the pump host thread) we cannot park, so the yield
