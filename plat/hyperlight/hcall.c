@@ -42,6 +42,7 @@
 #ifdef CONFIG_HYPERLIGHT_POLL
 #include <hyperlight-x86/poll.h>
 #include <uk/lcpu.h>
+#include <uk/thread.h>
 #endif
 
 /* Maximum payload size for host calls */
@@ -478,11 +479,24 @@ static const __u8 *hcall_memmem(const __u8 *hay, __sz hlen,
  * keyed by the op's guest-allocated request_id (nonzero u64). On each
  * host `poll`, hyperlight_poll_pump() calls hyperlight_hcall_deliver_batch()
  * with the JSON object of all completed/errored tasks; each matching op
- * is resolved in place and unregistered. The list is mutated only from
- * the (single, cooperatively-scheduled) vCPU, but a thread can be woken
- * from the wait queue between list operations, so mutations are guarded
- * by a brief IRQ-off critical section.
+ * is resolved in place, unregistered, and its waiting thread is woken.
+ * Mutations are guarded by a brief IRQ-off critical section.
  * ------------------------------------------------------------------ */
+enum {
+	HYPERLIGHT_HCALL_READY = 0,
+	HYPERLIGHT_HCALL_PENDING = 1,
+};
+
+struct hyperlight_hcall_op {
+	__u8 *resp;
+	__sz resp_cap;
+	__sz resp_len;
+	__u64 request_id;
+	int state;
+	struct uk_thread *waiter;
+	struct hyperlight_hcall_op *next;
+};
+
 static struct hyperlight_hcall_op *hl_pending_ops;
 
 /* Monotonically increasing, nonzero request-ID counter, stored in static
@@ -496,8 +510,7 @@ static __u64 hl_next_request_id = 1;
  * single hyperlight_hcall_submit() call with no intervening cooperative yield
  * (hyperlight_hcall_once() only encodes, pushes and triggers the VM exit — it
  * never parks), so the "one dispatch at a time" invariant that guards
- * hcall_encode_buf covers this buffer too. Back-to-back multi-await submits run
- * sequentially on the vCPU and cannot interleave mid-wrap.
+ * hcall_encode_buf covers this buffer too.
  */
 static __u8 hl_wrap_buf[HCALL_MAX_PAYLOAD + HCALL_WRAP_OVERHEAD];
 
@@ -826,12 +839,14 @@ void hyperlight_hcall_deliver_batch(const __u8 *json, __sz json_len)
 			continue;
 		op->state = HYPERLIGHT_HCALL_READY;
 		hcall_registry_del(op);
+		if (op->waiter)
+			uk_thread_wake(op->waiter);
 	}
 }
 
-int hyperlight_hcall_submit(struct hyperlight_hcall_op *op,
-			    const __u8 *req, __sz req_len,
-			    __u8 *resp, __sz resp_cap)
+static int hyperlight_hcall_submit(struct hyperlight_hcall_op *op,
+				   const __u8 *req, __sz req_len,
+				   __u8 *resp, __sz resp_cap)
 {
 	__u64 id;
 	__sz wrap_len;
@@ -846,6 +861,7 @@ int hyperlight_hcall_submit(struct hyperlight_hcall_op *op,
 	op->resp_len = 0;
 	op->request_id = 0;
 	op->next = __NULL;
+	op->waiter = uk_thread_current();
 	op->state = HYPERLIGHT_HCALL_READY;
 
 	/* Allocate a nonzero request ID, collision-free with active ops. */
@@ -879,7 +895,7 @@ int hyperlight_hcall_submit(struct hyperlight_hcall_op *op,
 	return 0;
 }
 
-int hyperlight_hcall_poll(struct hyperlight_hcall_op *op)
+static int hyperlight_hcall_poll(struct hyperlight_hcall_op *op)
 {
 	UK_ASSERT(op);
 
@@ -925,24 +941,8 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 	if (rc < 0)
 		return rc;
 
-	/* Await loop. While the host reports the operation is still pending —
-	 * a hexadecimal yield sentinel — park until the next host `poll`. Each poll
-	 * pump delivers all completed/errored task results via
-	 * hyperlight_hcall_deliver_batch(), which resolves this op in place if
-	 * its hexadecimal request_id key is among them; the state check below then
-	 * sees READY. The caller's stack is preserved across the VM exit, so on
-	 * resume execution continues exactly where it left off. Outside a poll
-	 * pump (or on the pump host thread) we cannot park, so the yield
-	 * sentinel is returned to the caller as-is.
-	 *
-	 * This is the single-await specialisation of the submit/poll primitives
-	 * above; multi-await callers submit several ops and poll each across
-	 * successive host `poll`s instead.
-	 */
 	while (op.state == HYPERLIGHT_HCALL_PENDING &&
-	       hyperlight_poll_current_can_park()) {
-		hyperlight_hcall_park_retry();
-
+	       hyperlight_poll_park()) {
 		rc = hyperlight_hcall_poll(&op);
 		if (rc < 0) {
 			hcall_registry_del(&op);

@@ -59,25 +59,11 @@ void hyperlight_poll_pump(void);
 int hyperlight_poll_halt(__nsec wakeup_time);
 
 /**
- * @return Non-zero if the caller can be parked and later resumed by a poll
- *         pump — i.e. a pump is in flight and the caller is a schedulable
- *         thread other than the pump's own host thread. Used by
- *         timer and host-call wait paths before suspending the current thread.
- */
-int hyperlight_poll_current_can_park(void);
-
-/**
- * Park the calling thread until the next poll pump, then return.
+ * Park the calling thread until explicitly woken.
  *
- * Used by hyperlight_hcall() when a host function call reports that its
- * result is not ready ("yield"). The caller's stack (deep inside whatever
- * issued the host call) is preserved by the scheduler, so when the host
- * re-invokes `poll` and the pump wakes this thread, execution resumes right
- * where it parked and checks the completion batch delivered by the pump.
- *
- * Must only be called when hyperlight_poll_current_can_park() is true.
+ * @return Non-zero if the caller was parked and resumed, otherwise zero.
  */
-void hyperlight_hcall_park_retry(void);
+int hyperlight_poll_park(void);
 
 #ifdef __cplusplus
 }

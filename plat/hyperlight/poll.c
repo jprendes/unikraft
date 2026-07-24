@@ -20,7 +20,6 @@
 #include <uk/thread.h>
 #include <uk/sched.h>
 #include <uk/sched_impl.h>
-#include <uk/wait.h>
 #include <hyperlight-x86/hcall.h>
 #include <hyperlight-x86/poll.h>
 #include <hyperlight-x86/dispatch.h>
@@ -51,13 +50,6 @@ static struct uk_thread *hl_poll_idle_thread;
  * before it returns to the host.
  */
 static __nsec hl_poll_wakeup_time;
-
-/* Threads parked by hyperlight_hcall_park_retry() waiting to re-issue a host
- * call whose result was reported as not-yet-ready ("yield"). They are woken
- * once at the start of every poll pump, giving each parked caller exactly one
- * retry attempt per host `poll` invocation.
- */
-static DEFINE_WAIT_QUEUE(hl_hcall_retry_wq);
 
 /* Extract the first hlstring parameter from the in-flight `poll` FunctionCall
  * and deliver it as the completed/errored-task batch to any parked host calls.
@@ -112,7 +104,7 @@ static void hyperlight_poll_deliver_arg(void)
 	hyperlight_hcall_deliver_batch(b + s + 4, (__sz)slen);
 }
 
-int hyperlight_poll_current_can_park(void)
+static int hyperlight_poll_current_can_park(void)
 {
 	struct uk_thread *current;
 
@@ -158,28 +150,15 @@ int hyperlight_poll_halt(__nsec wakeup_time)
 	return 1;
 }
 
-void hyperlight_hcall_park_retry(void)
+int hyperlight_poll_park(void)
 {
 	struct uk_thread *current = uk_thread_current();
-	unsigned long flags;
 
-	UK_ASSERT(current);
-
-	/* Enqueue on the retry wait queue and block indefinitely, mirroring
-	 * the once-wait pattern in lib/uksched (uk/wait.h). The pump wakes the
-	 * whole queue on its next entry (see hyperlight_poll_pump).
-	 */
-	_uk_waitq_lock(&hl_hcall_retry_wq, flags);
-	_uk_waitq_add(&hl_hcall_retry_wq, current);
-	_uk_waitq_block_until(current, 0);
-	_uk_waitq_unlock(&hl_hcall_retry_wq, flags);
-
+	if (!hyperlight_poll_current_can_park())
+		return 0;
+	uk_thread_block(current);
 	uk_sched_yield();
-
-	/* Woken by the next poll pump; leave the queue before retrying. */
-	_uk_waitq_lock(&hl_hcall_retry_wq, flags);
-	_uk_waitq_remove(current);
-	_uk_waitq_unlock(&hl_hcall_retry_wq, flags);
+	return 1;
 }
 
 /* Report the next-wakeup deadline to the host via a synchronous host
@@ -256,15 +235,8 @@ void hyperlight_poll_pump(void)
 	flags = uk_lcpu_save_irqf();
 	uk_lcpu_enable_irq();
 
-	/* A new host `poll` entry is when async host-side results may have
-	 * become ready. First deliver the batch of completed/errored task
-	 * results the host passed as this poll's argument to the matching
-	 * parked ops (marking them READY), then wake every caller parked by
-	 * hyperlight_hcall_park_retry() so each re-checks its op once this
-	 * poll. Threads whose result is still pending simply re-park below.
-	 */
+	/* Deliver completed host calls and wake their matching guest threads. */
 	hyperlight_poll_deliver_arg();
-	uk_waitq_wake_up(&hl_hcall_retry_wq);
 
 #ifdef CONFIG_LIBHOSTSOCK
 	/* A host `poll` re-entry is our chance to observe socket I/O that

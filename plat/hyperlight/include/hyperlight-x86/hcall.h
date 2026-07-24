@@ -62,83 +62,14 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 		     __u8 *resp, __sz resp_cap, __sz *resp_len);
 
 #ifdef CONFIG_HYPERLIGHT_POLL
-/* State of a non-blocking host call tracked by a struct hyperlight_hcall_op. */
-enum {
-	/* op->resp holds the final result; op->resp_len is its length. */
-	HYPERLIGHT_HCALL_READY   = 0,
-	/* The host reported the operation is still pending; op->request_id
-	 * holds the guest-allocated ID used to match the completion batch entry.
-	 */
-	HYPERLIGHT_HCALL_PENDING = 1,
-};
-
-/**
- * A single in-flight (possibly-yielding) host function call.
- *
- * This is the building block for *multi-await*: a caller can submit several
- * host calls with hyperlight_hcall_submit() — each returns immediately with a
- * request ID rather than blocking — and then wait for any of them to complete
- * by driving hyperlight_hcall_poll() on each across successive host `poll`s.
- * The blocking hyperlight_hcall() is itself implemented as submit + park/poll
- * of a single op.
- *
- * The result buffer @resp is caller-owned and must outlive the op; the final
- * result lives there once the op is READY.
- */
-struct hyperlight_hcall_op {
-	__u8 *resp;		/* caller-owned result buffer */
-	__sz  resp_cap;		/* capacity of @resp */
-	__sz  resp_len;		/* bytes valid in @resp */
-	__u64 request_id;	/* guest-allocated nonzero ID (0 = no batch lookup) */
-	int   state;		/* HYPERLIGHT_HCALL_{READY,PENDING} */
-	struct hyperlight_hcall_op *next; /* intrusive link, pending-op registry */
-};
-
-/**
- * Submit a host call without blocking.
- *
- * Allocates a monotone nonzero u64 request ID, encodes it as a fixed-width
- * lowercase hex string in the request wrapper, and issues it once. If the host
- * answers immediately, @op->state is HYPERLIGHT_HCALL_READY and the result is
- * in @resp. If the host yields, its hexadecimal ID is validated against the
- * allocated one; a mismatch or malformed sentinel is an explicit protocol
- * error (-8). On a valid yield @op->state is HYPERLIGHT_HCALL_PENDING and the
- * op is registered so a later
- * hyperlight_hcall_deliver_batch() can resolve it. Does NOT park, so it is
- * safe to call outside a poll pump and to submit several ops back-to-back
- * before waiting on any.
- *
- * @return 0 on success (check @op->state), negative on transport or protocol
- *         failure (see hyperlight_hcall return codes, including -8 and -9).
- */
-int hyperlight_hcall_submit(struct hyperlight_hcall_op *op,
-			    const __u8 *req, __sz req_len,
-			    __u8 *resp, __sz resp_cap);
-
-/**
- * Poll a pending op once, WITHOUT parking or issuing a host call.
- *
- * Completion is delivered out-of-band by hyperlight_hcall_deliver_batch() (from
- * the poll pump, using the JSON the host passes to the `poll` guest function),
- * which marks the op READY. If READY, this function copies the result from the
- * stable batch snapshot into @op->resp. The caller parks between polls (e.g. via
- * hyperlight_hcall_park_retry()) and re-checks after each host `poll`.
- *
- * @return 1 if now READY, 0 if still PENDING, negative on failure (-8 if
- *         the op is PENDING with no valid request ID).
- */
-int hyperlight_hcall_poll(struct hyperlight_hcall_op *op);
-
 /**
  * Deliver a batch of completed/errored host-call results to parked ops.
  *
  * @json is the JSON object the host passes as the `poll` guest function's
  * argument: {"<16-digit-hex-id>":{"result":…}|{"error":…}, …}. For every
  * registered PENDING op whose hexadecimal request_id string appears as a key,
- * the corresponding value object remains in a stable batch snapshot, the op is
- * marked READY and removed from the pending-op registry. The caller later copies
- * that value into @resp via hyperlight_hcall_poll(). Ops whose IDs are absent
- * stay pending. Called by hyperlight_poll_pump() before it wakes parked callers.
+ * the corresponding value object remains in a stable batch snapshot and the
+ * matching caller is woken. Ops whose IDs are absent stay pending.
  */
 void hyperlight_hcall_deliver_batch(const __u8 *json, __sz json_len);
 #endif /* CONFIG_HYPERLIGHT_POLL */
