@@ -41,7 +41,6 @@
 #include <hyperlight-x86/fb.h>
 #ifdef CONFIG_HYPERLIGHT_POLL
 #include <hyperlight-x86/poll.h>
-#include <uk/lcpu.h>
 #include <uk/thread.h>
 #endif
 
@@ -479,20 +478,13 @@ static const __u8 *hcall_memmem(const __u8 *hay, __sz hlen,
  * keyed by the op's guest-allocated request_id (nonzero u64). On each
  * host `poll`, hyperlight_poll_pump() calls hyperlight_hcall_deliver_batch()
  * with the JSON object of all completed/errored tasks; each matching op
- * is resolved in place, unregistered, and its waiting thread is woken.
- * Mutations are guarded by a brief IRQ-off critical section.
+ * is resolved in place, unregistered, and its waiting thread is woken. All
+ * mutations run synchronously on the single cooperative vCPU without yielding.
  * ------------------------------------------------------------------ */
-enum {
-	HYPERLIGHT_HCALL_READY = 0,
-	HYPERLIGHT_HCALL_PENDING = 1,
-};
-
 struct hyperlight_hcall_op {
-	__u8 *resp;
-	__sz resp_cap;
-	__sz resp_len;
 	__u64 request_id;
-	int state;
+	const __u8 *completion;
+	__sz completion_len;
 	struct uk_thread *waiter;
 	struct hyperlight_hcall_op *next;
 };
@@ -506,10 +498,8 @@ static __u64 hl_next_request_id = 1;
 
 /* Wrapping buffer for {"__hl_request_id":<id>,"request":<req>}.
  *
- * Shared static, like hcall_encode_buf: it is filled and consumed within a
- * single hyperlight_hcall_submit() call with no intervening cooperative yield
- * (hyperlight_hcall_once() only encodes, pushes and triggers the VM exit — it
- * never parks), so the "one dispatch at a time" invariant that guards
+ * Shared static, like hcall_encode_buf: it is filled and consumed before any
+ * cooperative yield, so the "one dispatch at a time" invariant that guards
  * hcall_encode_buf covers this buffer too.
  */
 static __u8 hl_wrap_buf[HCALL_MAX_PAYLOAD + HCALL_WRAP_OVERHEAD];
@@ -521,23 +511,19 @@ static __u8 hl_wrap_buf[HCALL_MAX_PAYLOAD + HCALL_WRAP_OVERHEAD];
  * (e.g. hostsock's rpc_resp): between the poll pump copying a result and the
  * woken caller reading it, other cooperatively-scheduled threads may run and
  * clobber that shared buffer. hl_batch_buf is written only by the pump (IRQs
- * off, no concurrent writer) and read by each woken caller's poll() before it
- * consults its response buffer, so it is stable across the wake window. It is
- * only overwritten on the next pump, by which point every caller woken by the
- * previous pump has already run (the pump returns to the host only once the
- * scheduler is idle) and copied out its value.
+ * off, no concurrent writer) and read by each woken caller before it returns,
+ * so it is stable across the wake window. It is only overwritten on the next
+ * pump, by which point every caller woken by the previous pump has already run
+ * (the pump returns to the host only once the scheduler is idle) and copied out
+ * its value.
  */
 static __u8 hl_batch_buf[HCALL_MAX_PAYLOAD];
 static __sz hl_batch_len;
 
-static void hcall_registry_add(struct hyperlight_hcall_op *op)
+static __noinline void hcall_registry_add(struct hyperlight_hcall_op *op)
 {
-	unsigned long flags = uk_lcpu_save_irqf();
-
 	op->next = hl_pending_ops;
 	hl_pending_ops = op;
-
-	uk_lcpu_restore_irqf(flags);
 }
 
 /* Remove @op from the registry if present. Idempotent: a no-op when @op
@@ -546,7 +532,6 @@ static void hcall_registry_add(struct hyperlight_hcall_op *op)
 static void hcall_registry_del(struct hyperlight_hcall_op *op)
 {
 	struct hyperlight_hcall_op **pp;
-	unsigned long flags = uk_lcpu_save_irqf();
 
 	for (pp = &hl_pending_ops; *pp; pp = &(*pp)->next) {
 		if (*pp == op) {
@@ -555,8 +540,6 @@ static void hcall_registry_del(struct hyperlight_hcall_op *op)
 			break;
 		}
 	}
-
-	uk_lcpu_restore_irqf(flags);
 }
 
 /* Encode a u64 as exactly 16 lowercase hexadecimal digits (no NUL). */
@@ -568,10 +551,7 @@ static void hcall_id_to_hex(__u64 v, char buf[HCALL_ID_HEX_LEN])
 		buf[i] = digits[(v >> ((HCALL_ID_HEX_LEN - 1 - i) * 4)) & 0xf];
 }
 
-/* Return 1 if @id is already registered in the pending-op list, 0 otherwise.
- * Callers must hold the registry IRQ-off critical section (see hcall_alloc_id)
- * so the walk sees a stable list.
- */
+/* Return 1 if @id is already registered, 0 otherwise. */
 static int hcall_id_in_use(__u64 id)
 {
 	struct hyperlight_hcall_op *op;
@@ -582,37 +562,19 @@ static int hcall_id_in_use(__u64 id)
 	return 0;
 }
 
-/* Allocate the next available nonzero monotone request ID.
- *
- * Advances hl_next_request_id, skipping 0 on wrap, and retries up to 64
- * times if the candidate ID is already live in the pending-op registry (can
- * only happen after a full 2^64 wrap cycle). Returns 0 when all 64 candidates
- * are in use, which is treated as exhaustion (-9) by the caller.
- *
- * The counter bump and registry scan run in a single IRQ-off critical section,
- * matching hcall_registry_add()/del(). The cooperative single-vCPU scheduler
- * cannot switch callers between allocation and registration because that path
- * contains no scheduler yield.
- */
+/* Allocate the next unused nonzero request ID. */
 static __u64 hcall_alloc_id(void)
 {
-	unsigned long flags = uk_lcpu_save_irqf();
-	__u64 result = 0;
-	int tries;
+	__u64 id;
 
-	for (tries = 0; tries < 64; tries++) {
-		__u64 id = hl_next_request_id++;
+	do {
+		id = hl_next_request_id++;
 
 		if (hl_next_request_id == 0)
-			hl_next_request_id = 1; /* skip 0 on wrap */
-		if (!hcall_id_in_use(id)) {
-			result = id;
-			break;
-		}
-	}
+			hl_next_request_id = 1;
+	} while (hcall_id_in_use(id));
 
-	uk_lcpu_restore_irqf(flags);
-	return result; /* 0 == exhausted */
+	return id;
 }
 
 /* Build the wrapped request in hl_wrap_buf:
@@ -801,16 +763,14 @@ static int hcall_batch_find(const __u8 *json, __sz json_len,
 
 void hyperlight_hcall_deliver_batch(const __u8 *json, __sz json_len)
 {
-	struct hyperlight_hcall_op *op;
-	struct hyperlight_hcall_op *next;
+	struct hyperlight_hcall_op **pp;
 
 	if (!json || json_len == 0)
 		return;
 
-	/* Snapshot the batch into the stable kernel buffer. Each woken caller
-	 * re-scans this (in hyperlight_hcall_poll) for its own request_id and
-	 * copies the value into its response buffer on its own thread, right
-	 * before it reads that buffer — avoiding the shared-response-buffer
+	/* Snapshot the batch into stable kernel memory. Each matching operation
+	 * retains its value's location so its caller can copy the result after it
+	 * is woken, avoiding a second batch scan and the shared-response-buffer
 	 * clobber window (see hl_batch_buf).
 	 */
 	if (json_len > sizeof(hl_batch_buf))
@@ -818,139 +778,78 @@ void hyperlight_hcall_deliver_batch(const __u8 *json, __sz json_len)
 	memcpy(hl_batch_buf, json, json_len);
 	hl_batch_len = json_len;
 
-	/* Mark every registered PENDING op whose hexadecimal ID key is in the
-	 * batch READY and unregister it; the value copy is deferred to poll().
-	 * The list is only grown by not-yet-parked threads and we run with the
-	 * woken threads still blocked, so walking it here is safe.
+	/* Resolve every registered operation whose hexadecimal ID is present and
+	 * unregister it. The callers are still blocked while this list is walked.
 	 */
-	for (op = hl_pending_ops; op; op = next) {
+	for (pp = &hl_pending_ops; *pp;) {
+		struct hyperlight_hcall_op *op = *pp;
 		char id_str[HCALL_ID_HEX_LEN];
 		const __u8 *val;
 		__sz val_len;
 
-		next = op->next;
-
-		if (op->state != HYPERLIGHT_HCALL_PENDING || !op->request_id)
-			continue;
 		hcall_id_to_hex(op->request_id, id_str);
 		if (!hcall_batch_find(hl_batch_buf, hl_batch_len,
 				      (const __u8 *)id_str, HCALL_ID_HEX_LEN,
-				      &val, &val_len))
+				      &val, &val_len)) {
+			pp = &op->next;
 			continue;
-		op->state = HYPERLIGHT_HCALL_READY;
-		hcall_registry_del(op);
+		}
+		op->completion = val;
+		op->completion_len = val_len;
+		*pp = op->next;
+		op->next = __NULL;
 		if (op->waiter)
 			uk_thread_wake(op->waiter);
 	}
 }
 
-static int hyperlight_hcall_submit(struct hyperlight_hcall_op *op,
-				   const __u8 *req, __sz req_len,
-				   __u8 *resp, __sz resp_cap)
-{
-	__u64 id;
-	__sz wrap_len;
-	__sz got = 0;
-	__u64 yield_id;
-	int rc, y;
-
-	UK_ASSERT(op);
-
-	op->resp = resp;
-	op->resp_cap = resp_cap;
-	op->resp_len = 0;
-	op->request_id = 0;
-	op->next = __NULL;
-	op->waiter = uk_thread_current();
-	op->state = HYPERLIGHT_HCALL_READY;
-
-	/* Allocate a nonzero request ID, collision-free with active ops. */
-	id = hcall_alloc_id();
-	if (!id)
-		return -9; /* ID space exhausted */
-
-	/* Wrap with the fixed-width hexadecimal request ID. */
-	wrap_len = hcall_wrap_request(id, req, req_len);
-	if (!wrap_len)
-		return -3; /* request too large to wrap */
-
-	rc = hyperlight_hcall_once(hl_wrap_buf, wrap_len, resp, resp_cap, &got);
-	if (rc < 0)
-		return rc;
-	op->resp_len = got;
-
-	/* Classify the response: no __hl_yield__ key → READY with real result;
-	 * valid hexadecimal yield ID matching @id → PENDING, register for delivery;
-	 * any other case (malformed, mismatched ID) → protocol error -8.
-	 */
-	y = hcall_extract_yield_id(resp, got, &yield_id);
-	if (y == 0)
-		return 0; /* real result, op stays READY */
-	if (y < 0 || yield_id != id)
-		return -8; /* malformed or mismatched yield ID */
-
-	op->request_id = id;
-	op->state = HYPERLIGHT_HCALL_PENDING;
-	hcall_registry_add(op);
-	return 0;
-}
-
-static int hyperlight_hcall_poll(struct hyperlight_hcall_op *op)
-{
-	UK_ASSERT(op);
-
-	/* Completion is signalled out-of-band by hyperlight_hcall_deliver_batch
-	 * (from the poll pump), which marks the op READY. The value itself is
-	 * copied here, on the caller's own thread, so that the window between
-	 * this copy and the caller consuming op->resp contains no cooperative
-	 * yield — a shared response buffer cannot be clobbered by another
-	 * thread in between (see hl_batch_buf).
-	 */
-	if (op->state == HYPERLIGHT_HCALL_READY) {
-		if (op->request_id) {
-			char id_str[HCALL_ID_HEX_LEN];
-			const __u8 *val;
-			__sz val_len;
-
-			hcall_id_to_hex(op->request_id, id_str);
-			if (hcall_batch_find(hl_batch_buf, hl_batch_len,
-					     (const __u8 *)id_str,
-					     HCALL_ID_HEX_LEN,
-					     &val, &val_len)) {
-				if (val_len > op->resp_cap)
-					val_len = op->resp_cap;
-				memcpy(op->resp, val, val_len);
-				op->resp_len = val_len;
-			}
-		}
-		return 1;
-	}
-	if (!op->request_id)
-		return -8; /* pending but no valid request ID */
-	return 0;	   /* still pending */
-}
 #endif /* CONFIG_HYPERLIGHT_POLL */
 
 int hyperlight_hcall(const __u8 *req, __sz req_len,
 		     __u8 *resp, __sz resp_cap, __sz *resp_len)
 {
 #ifdef CONFIG_HYPERLIGHT_POLL
-	struct hyperlight_hcall_op op;
-	int rc = hyperlight_hcall_submit(&op, req, req_len, resp, resp_cap);
+	struct hyperlight_hcall_op op = {
+		.waiter = uk_thread_current(),
+	};
+	__u64 id;
+	__u64 yield_id;
+	__sz wrap_len;
+	__sz got = 0;
+	int rc;
+	int y;
 
+	id = hcall_alloc_id();
+	wrap_len = hcall_wrap_request(id, req, req_len);
+	if (!wrap_len)
+		return -3;
+
+	rc = hyperlight_hcall_once(hl_wrap_buf, wrap_len,
+				  resp, resp_cap, &got);
 	if (rc < 0)
 		return rc;
 
-	while (op.state == HYPERLIGHT_HCALL_PENDING &&
-	       hyperlight_poll_park()) {
-		rc = hyperlight_hcall_poll(&op);
-		if (rc < 0) {
-			hcall_registry_del(&op);
-			return rc;
-		}
+	y = hcall_extract_yield_id(resp, got, &yield_id);
+	if (y == 0) {
+		if (resp_len)
+			*resp_len = got;
+		return 0;
+	}
+	if (y < 0 || yield_id != id)
+		return -8;
+
+	op.request_id = id;
+	hcall_registry_add(&op);
+
+	while (op.request_id && !op.completion && hyperlight_poll_park())
+		;
+
+	if (op.completion) {
+		got = MIN(op.completion_len, resp_cap);
+		memcpy(resp, op.completion, got);
 	}
 
-	/* Defensively unregister: covers the unparkable path (op still PENDING
+	/* Defensively unregister: covers the unparkable path (op still pending
 	 * but we're returning the raw sentinel) so the registry never retains a
 	 * pointer to this about-to-be-freed on-stack op. Idempotent when the op
 	 * was already delivered/removed.
@@ -958,7 +857,7 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 	hcall_registry_del(&op);
 
 	if (resp_len)
-		*resp_len = op.resp_len;
+		*resp_len = got;
 	return 0;
 #else /* !CONFIG_HYPERLIGHT_POLL */
 	__sz got = 0;

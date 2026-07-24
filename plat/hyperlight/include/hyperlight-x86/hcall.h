@@ -55,8 +55,7 @@ extern "C" {
  *         -6 FlatBuffer decode failed,
  *         -7 response buffer too small,
  *         -8 (CONFIG_HYPERLIGHT_POLL) yield sentinel has a malformed or
- *            mismatched hexadecimal ID — protocol error,
- *         -9 (CONFIG_HYPERLIGHT_POLL) request ID allocation exhausted.
+ *            mismatched hexadecimal ID — protocol error.
  */
 int hyperlight_hcall(const __u8 *req, __sz req_len,
 		     __u8 *resp, __sz resp_cap, __sz *resp_len);
