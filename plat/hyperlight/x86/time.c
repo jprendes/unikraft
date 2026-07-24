@@ -130,7 +130,7 @@ void time_block_until(__snsec until)
 	 * application thread in the scheduler. In non-poll builds this hook is
 	 * an inline no-op and execution continues into the legacy host sleep.
 	 */
-	if (hyperlight_poll_block_until((__nsec)until))
+	if (hyperlight_poll_halt((__nsec)until))
 		return;
 
 	while ((__snsec) ukplat_monotonic_clock() < until) {

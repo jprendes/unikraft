@@ -47,15 +47,10 @@ static struct uk_thread *hl_poll_host_thread;
  */
 static struct uk_thread *hl_poll_idle_thread;
 
-/* Set for the duration of a poll pump so its idle thread returns to the host
- * instead of halting the CPU in-guest.
- */
-static volatile int hl_poll_in_flight;
-
 /* Next-wakeup deadline recorded by the idle path and consumed by the pump
  * before it returns to the host.
  */
-static volatile __nsec hl_poll_wakeup_time;
+static __nsec hl_poll_wakeup_time;
 
 /* Threads parked by hyperlight_hcall_park_retry() waiting to re-issue a host
  * call whose result was reported as not-yet-ready ("yield"). They are woken
@@ -126,7 +121,7 @@ int hyperlight_poll_current_can_park(void)
 	 * the host thread would deadlock the pump — it is what returns control
 	 * to the host).
 	 */
-	if (!hl_poll_in_flight)
+	if (!hl_poll_host_thread)
 		return 0;
 
 	current = uk_thread_current();
@@ -136,18 +131,29 @@ int hyperlight_poll_current_can_park(void)
 	return 1;
 }
 
-int hyperlight_poll_block_until(__nsec until)
+static int hyperlight_poll_idle_return(__nsec wakeup_time)
+{
+	if (!hl_poll_host_thread ||
+	    uk_thread_current() != hl_poll_idle_thread)
+		return 0;
+
+	hl_poll_wakeup_time = wakeup_time;
+	uk_sched_thread_switch(hl_poll_host_thread);
+	return 1;
+}
+
+int hyperlight_poll_halt(__nsec wakeup_time)
 {
 	struct uk_thread *current;
 
-	if (hyperlight_poll_idle_return(until))
+	if (hyperlight_poll_idle_return(wakeup_time))
 		return 1;
-	if (!hyperlight_poll_current_can_park())
+	if (!wakeup_time || !hyperlight_poll_current_can_park())
 		return 0;
 
 	current = uk_thread_current();
 	UK_ASSERT(current);
-	uk_thread_block_until(current, until);
+	uk_thread_block_until(current, wakeup_time);
 	uk_sched_yield();
 	return 1;
 }
@@ -240,7 +246,6 @@ void hyperlight_poll_pump(void)
 	 */
 	hl_poll_host_thread = uk_thread_current();
 	hl_poll_idle_thread = idle;
-	hl_poll_in_flight = 1;
 
 	/* The cooperative scheduler requires IRQs enabled: schedcoop_schedule()
 	 * asserts this, and the idle thread we switch into will call it. The
@@ -288,7 +293,6 @@ void hyperlight_poll_pump(void)
 	uk_lcpu_restore_irqf(flags);
 
 	/* Snapshot and clear the shared state. */
-	hl_poll_in_flight = 0;
 	wakeup_time = hl_poll_wakeup_time;
 	hl_poll_host_thread = NULL;
 	hl_poll_idle_thread = NULL;
@@ -309,23 +313,4 @@ void hyperlight_poll_pump(void)
 	}
 
 	hyperlight_poll_report(ns);
-}
-
-int hyperlight_poll_idle_return(__nsec wakeup_time)
-{
-	/* Only intercept the current pump's idle thread. In particular, poll
-	 * application threads may enter time_block_until() and must park/yield.
-	 */
-	if (!hl_poll_in_flight || !hl_poll_host_thread ||
-	    uk_thread_current() != hl_poll_idle_thread)
-		return 0;
-
-	hl_poll_wakeup_time = wakeup_time;
-
-	/* Switch back to the thread that called hyperlight_poll_pump(). This
-	 * saves the idle thread's context, so the next `poll` resumes the
-	 * idle thread right here and it re-checks the run queue.
-	 */
-	uk_sched_thread_switch(hl_poll_host_thread);
-	return 1;
 }

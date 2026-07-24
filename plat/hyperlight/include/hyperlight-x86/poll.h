@@ -45,32 +45,18 @@ extern "C" {
 void hyperlight_poll_pump(void);
 
 /**
- * Intercept a platform halt by the active poll pump's idle thread.
+ * Handle a platform halt while a poll pump is active.
  *
- * Hyperlight's timed and untimed halt implementations call this before their
- * legacy blocking behavior. The halt is intercepted only when the caller is
- * the idle thread currently driven by hyperlight_poll_pump(); application
- * threads continue to use the normal park or sleep paths. On interception,
- * the deadline is recorded and control switches back to the pump. Execution
- * resumes inside this function on the next `poll`, then returns to the idle
- * thread so it can re-check the run queue.
+ * The pump's idle thread returns to the host with @wakeup_time as its next
+ * deadline. For a nonzero deadline, an application thread is instead parked
+ * in the guest scheduler until that time. Outside a poll pump the halt is not
+ * handled and the caller must use its legacy path.
  *
  * @param wakeup_time    Absolute monotonic-clock deadline of the next
  *                       sleeping thread, or 0 if none.
- * @return Non-zero if the halt was intercepted, otherwise zero.
+ * @return Non-zero if the halt was handled, otherwise zero.
  */
-int hyperlight_poll_idle_return(__nsec wakeup_time);
-
-/**
- * Handle a timed wait according to the active poll execution context.
- *
- * The pump's idle thread returns to the host with @until as its next deadline;
- * an application thread is parked in the guest scheduler until @until. Outside
- * a poll pump the wait is not handled and the caller must use its legacy path.
- *
- * @return Non-zero if the wait was handled, otherwise zero.
- */
-int hyperlight_poll_block_until(__nsec until);
+int hyperlight_poll_halt(__nsec wakeup_time);
 
 /**
  * @return Non-zero if the caller can be parked and later resumed by a poll
@@ -100,15 +86,9 @@ void hyperlight_hcall_park_retry(void);
 /* Keep poll-versus-legacy decisions inside the Hyperlight platform. Callers
  * use these hooks unconditionally; non-poll builds compile them away.
  */
-static inline int hyperlight_poll_idle_return(__nsec wakeup_time)
+static inline int hyperlight_poll_halt(__nsec wakeup_time)
 {
 	(void)wakeup_time;
-	return 0;
-}
-
-static inline int hyperlight_poll_block_until(__nsec until)
-{
-	(void)until;
 	return 0;
 }
 #endif /* CONFIG_HYPERLIGHT_POLL */

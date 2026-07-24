@@ -58,7 +58,7 @@ static void hyperlight_halt_irq(void)
 	/* Let only the idle thread driven by a poll pump yield back to it.
 	 * In non-poll builds the hook compiles to a no-op.
 	 */
-	if (hyperlight_poll_idle_return(0))
+	if (hyperlight_poll_halt(0))
 		return;
 	time_block_until((__snsec)ukplat_monotonic_clock() + 1000000000LL);
 }
