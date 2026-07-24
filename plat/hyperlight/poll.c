@@ -136,6 +136,22 @@ int hyperlight_poll_current_can_park(void)
 	return 1;
 }
 
+int hyperlight_poll_block_until(__nsec until)
+{
+	struct uk_thread *current;
+
+	if (hyperlight_poll_idle_return(until))
+		return 1;
+	if (!hyperlight_poll_current_can_park())
+		return 0;
+
+	current = uk_thread_current();
+	UK_ASSERT(current);
+	uk_thread_block_until(current, until);
+	uk_sched_yield();
+	return 1;
+}
+
 void hyperlight_hcall_park_retry(void)
 {
 	struct uk_thread *current = uk_thread_current();
