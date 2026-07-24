@@ -133,11 +133,11 @@ void time_block_until(__snsec until)
 {
 #ifdef CONFIG_HYPERLIGHT_POLL
 	/*
-	 * Cooperative poll model: when a host `poll` invocation is driving the
-	 * scheduler, a timer wait must PARK the calling thread and yield so the
-	 * scheduler can run the other threads and reach the idle thread, which
-	 * hands control back to the host (hyperlight_poll_idle_return) with the
-	 * next wakeup deadline. Looping on __hl_sleep here instead keeps the
+	 * Cooperative poll model: the active pump's idle thread reports the
+	 * scheduler deadline and yields directly back to the pump. A timer wait
+	 * from an application thread instead PARKS that thread and yields so the
+	 * scheduler can run other threads and eventually reach idle. Looping on
+	 * __hl_sleep here instead keeps the
 	 * vCPU inside this same host `poll` call — __hl_sleep is a *nested*
 	 * hostcall that resumes the guest in place — so the host-side
 	 * host `poll` never returns and checkpoint/restore stalls (the host
@@ -149,6 +149,9 @@ void time_block_until(__snsec until)
 	 * park on the relevant pollq (uk_file_poll_until) for prompt,
 	 * event-driven wakeups rather than relying on this deadline.
 	 */
+	if (hyperlight_poll_idle_return((__nsec)until))
+		return;
+
 	if (hyperlight_poll_current_can_park()) {
 		struct uk_thread *current = uk_thread_current();
 

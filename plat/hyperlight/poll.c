@@ -37,13 +37,18 @@ extern int hostsock_rescan_events(void);
 #endif
 
 /* The thread that the host `poll` invocation runs on. Captured on entry to
- * hyperlight_poll_pump() so the scheduler idle path can switch back to it.
+ * hyperlight_poll_pump() so the platform halt path can switch back to it.
  * NULL while no poll is in flight.
  */
 static struct uk_thread *hl_poll_host_thread;
 
-/* Set for the duration of a poll pump so the scheduler idle path returns
- * to the host instead of halting the CPU in-guest.
+/* The scheduler idle thread driven by the current pump. Platform halt paths
+ * use its identity to avoid intercepting waits made by application threads.
+ */
+static struct uk_thread *hl_poll_idle_thread;
+
+/* Set for the duration of a poll pump so its idle thread returns to the host
+ * instead of halting the CPU in-guest.
  */
 static volatile int hl_poll_in_flight;
 
@@ -58,11 +63,6 @@ static volatile __nsec hl_poll_wakeup_time;
  * retry attempt per host `poll` invocation.
  */
 static DEFINE_WAIT_QUEUE(hl_hcall_retry_wq);
-
-int hyperlight_poll_active(void)
-{
-	return hl_poll_in_flight;
-}
 
 /* Extract the first hlstring parameter from the in-flight `poll` FunctionCall
  * and deliver it as the completed/errored-task batch to any parked host calls.
@@ -218,10 +218,12 @@ void hyperlight_poll_pump(void)
 		return;
 	}
 
-	/* Remember the thread we are running on so the idle path can switch
-	 * back to it, and arm the idle hook.
+	/* Remember both ends of the context switch and arm the platform halt
+	 * interception. Tracking the idle thread ensures application-thread
+	 * waits are never mistaken for the scheduler becoming idle.
 	 */
 	hl_poll_host_thread = uk_thread_current();
+	hl_poll_idle_thread = idle;
 	hl_poll_in_flight = 1;
 
 	/* The cooperative scheduler requires IRQs enabled: schedcoop_schedule()
@@ -254,8 +256,8 @@ void hyperlight_poll_pump(void)
 
 	/* Switch directly into the scheduler idle thread. It drives every
 	 * runnable thread cooperatively (idle yields to the run queue); when
-	 * the run queue drains it reaches its halt point, where
-	 * hyperlight_poll_idle_return() switches control back to us.
+	 * the run queue drains it reaches its normal platform halt operation,
+	 * which switches control back to us.
 	 *
 	 * Entering via the idle thread (rather than yielding from the host
 	 * thread) guarantees the scheduler reaches idle even though the host
@@ -273,6 +275,7 @@ void hyperlight_poll_pump(void)
 	hl_poll_in_flight = 0;
 	wakeup_time = hl_poll_wakeup_time;
 	hl_poll_host_thread = NULL;
+	hl_poll_idle_thread = NULL;
 	hl_poll_wakeup_time = 0;
 
 	/* Translate the absolute deadline into a relative delay for the host.
@@ -292,13 +295,14 @@ void hyperlight_poll_pump(void)
 	hyperlight_poll_report(ns);
 }
 
-void hyperlight_poll_idle_return(struct uk_sched *s, __nsec wakeup_time)
+int hyperlight_poll_idle_return(__nsec wakeup_time)
 {
-	/* Only act inside a poll pump; otherwise return so the caller uses
-	 * the legacy in-guest halt path.
+	/* Only intercept the current pump's idle thread. In particular, poll
+	 * application threads may enter time_block_until() and must park/yield.
 	 */
-	if (!hl_poll_in_flight || !hl_poll_host_thread)
-		return;
+	if (!hl_poll_in_flight || !hl_poll_host_thread ||
+	    uk_thread_current() != hl_poll_idle_thread)
+		return 0;
 
 	hl_poll_wakeup_time = wakeup_time;
 
@@ -306,6 +310,6 @@ void hyperlight_poll_idle_return(struct uk_sched *s, __nsec wakeup_time)
 	 * saves the idle thread's context, so the next `poll` resumes the
 	 * idle thread right here and it re-checks the run queue.
 	 */
-	(void)s;
 	uk_sched_thread_switch(hl_poll_host_thread);
+	return 1;
 }

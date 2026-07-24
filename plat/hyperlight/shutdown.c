@@ -11,6 +11,9 @@
 
 #include <hyperlight-x86/outb.h>
 #include <hyperlight-x86/dispatch.h>
+#ifdef CONFIG_HYPERLIGHT_POLL
+#include <hyperlight-x86/poll.h>
+#endif
 
 #ifdef CONFIG_HYPERLIGHT_HCALL
 #include <uk/lcpu.h>
@@ -54,6 +57,13 @@ static int hyperlight_crash(void)
 #ifdef CONFIG_HYPERLIGHT_HCALL
 static void hyperlight_halt_irq(void)
 {
+#ifdef CONFIG_HYPERLIGHT_POLL
+	/* Let only the idle thread driven by a poll pump yield back to it.
+	 * Other callers retain the legacy bounded sleep below.
+	 */
+	if (hyperlight_poll_idle_return(0))
+		return;
+#endif
 	time_block_until((__snsec)ukplat_monotonic_clock() + 1000000000LL);
 }
 #endif

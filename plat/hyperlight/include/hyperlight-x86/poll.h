@@ -9,10 +9,9 @@
  *
  * Instead of running a guest function to full completion in a single VM
  * entry (see plat/hyperlight/dispatch.c), the poll model runs the
- * unikernel scheduler until it would go idle, then exits the VM back to
- * the host (the ordinary HALT / port-108 exit) carrying a next-wakeup
- * deadline. The host then re-invokes the `poll` guest function to make
- * further progress.
+ * unikernel scheduler until it would go idle, then returns from the guest
+ * function after reporting a next-wakeup deadline. The host then re-invokes
+ * the `poll` guest function to make further progress.
  *
  * This is safe with the register-reset re-entry that Hyperlight performs
  * on every guest-function call, because we only ever hand control back at
@@ -31,43 +30,35 @@
 extern "C" {
 #endif
 
-struct uk_sched;
-
 /**
  * Drive the scheduler until it would go idle, then return.
  *
  * Registered as the Hyperlight dispatch run-callback in poll mode (see
  * app-elfloader main.c). Called from hyperlight_dispatch_inner() on every
  * `poll` guest-function invocation. Switches into the scheduler so that
- * runnable threads execute cooperatively; when the run queue drains, the
- * scheduler idle path calls hyperlight_poll_idle_return() which switches
- * back here. Before returning (and thus HALTing to the host), the pump
- * reports the next-wakeup deadline via a host function call.
+ * runnable threads execute cooperatively. When the run queue drains, the
+ * idle thread's normal timed or untimed platform halt operation switches
+ * back here. Before returning, the pump reports the next-wakeup deadline
+ * via a host function call.
  */
 void hyperlight_poll_pump(void);
 
 /**
- * Hand control back to the host from the scheduler idle path.
+ * Intercept a platform halt by the active poll pump's idle thread.
  *
- * Called by the cooperative scheduler (lib/ukschedcoop) when it has
- * nothing runnable and would otherwise halt the CPU in-guest. Records the
- * scheduler's next-wakeup deadline (0 = no pending timer) and switches
- * back to the context saved by hyperlight_poll_pump(). Execution resumes
- * inside this function on the next `poll`, at which point it returns so
- * the idle thread re-checks the run queue.
+ * Hyperlight's timed and untimed halt implementations call this before their
+ * legacy blocking behavior. The halt is intercepted only when the caller is
+ * the idle thread currently driven by hyperlight_poll_pump(); application
+ * threads continue to use the normal park or sleep paths. On interception,
+ * the deadline is recorded and control switches back to the pump. Execution
+ * resumes inside this function on the next `poll`, then returns to the idle
+ * thread so it can re-check the run queue.
  *
- * @param s              The current cooperative scheduler.
  * @param wakeup_time    Absolute monotonic-clock deadline of the next
  *                       sleeping thread, or 0 if none.
+ * @return Non-zero if the halt was intercepted, otherwise zero.
  */
-void hyperlight_poll_idle_return(struct uk_sched *s, __nsec wakeup_time);
-
-/**
- * @return Non-zero while a poll pump is driving the scheduler. Used by the
- *         scheduler idle path to decide whether to return to the host
- *         (poll model) or halt the CPU in-guest (legacy model).
- */
-int hyperlight_poll_active(void);
+int hyperlight_poll_idle_return(__nsec wakeup_time);
 
 /**
  * @return Non-zero if the caller can be parked and later resumed by a poll
