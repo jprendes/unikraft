@@ -66,7 +66,7 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
  *
  * @json is the JSON object the host passes as the `poll` guest function's
  * argument: {"<16-digit-hex-id>":{"result":…}|{"error":…}, …}. For every
- * registered PENDING op whose hexadecimal request_id string appears as a key,
+ * registered op whose hexadecimal request_id string appears as a key,
  * the corresponding value object remains in a stable batch snapshot and the
  * matching caller is woken. Ops whose IDs are absent stay pending.
  */

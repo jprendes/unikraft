@@ -518,28 +518,11 @@ static __u8 hl_wrap_buf[HCALL_MAX_PAYLOAD + HCALL_WRAP_OVERHEAD];
  * its value.
  */
 static __u8 hl_batch_buf[HCALL_MAX_PAYLOAD];
-static __sz hl_batch_len;
 
 static __noinline void hcall_registry_add(struct hyperlight_hcall_op *op)
 {
 	op->next = hl_pending_ops;
 	hl_pending_ops = op;
-}
-
-/* Remove @op from the registry if present. Idempotent: a no-op when @op
- * was already delivered/removed (so callers can unregister defensively).
- */
-static void hcall_registry_del(struct hyperlight_hcall_op *op)
-{
-	struct hyperlight_hcall_op **pp;
-
-	for (pp = &hl_pending_ops; *pp; pp = &(*pp)->next) {
-		if (*pp == op) {
-			*pp = op->next;
-			op->next = __NULL;
-			break;
-		}
-	}
 }
 
 /* Encode a u64 as exactly 16 lowercase hexadecimal digits (no NUL). */
@@ -776,7 +759,6 @@ void hyperlight_hcall_deliver_batch(const __u8 *json, __sz json_len)
 	if (json_len > sizeof(hl_batch_buf))
 		json_len = sizeof(hl_batch_buf);
 	memcpy(hl_batch_buf, json, json_len);
-	hl_batch_len = json_len;
 
 	/* Resolve every registered operation whose hexadecimal ID is present and
 	 * unregister it. The callers are still blocked while this list is walked.
@@ -788,7 +770,7 @@ void hyperlight_hcall_deliver_batch(const __u8 *json, __sz json_len)
 		__sz val_len;
 
 		hcall_id_to_hex(op->request_id, id_str);
-		if (!hcall_batch_find(hl_batch_buf, hl_batch_len,
+		if (!hcall_batch_find(hl_batch_buf, json_len,
 				      (const __u8 *)id_str, HCALL_ID_HEX_LEN,
 				      &val, &val_len)) {
 			pp = &op->next;
@@ -841,20 +823,19 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 	op.request_id = id;
 	hcall_registry_add(&op);
 
-	while (op.request_id && !op.completion && hyperlight_poll_park())
+	while (!op.completion && hyperlight_poll_park())
 		;
 
 	if (op.completion) {
 		got = MIN(op.completion_len, resp_cap);
 		memcpy(resp, op.completion, got);
+	} else {
+		/* No park means no yield since insertion, so this is still the
+		 * registry head.
+		 */
+		UK_ASSERT(hl_pending_ops == &op);
+		hl_pending_ops = op.next;
 	}
-
-	/* Defensively unregister: covers the unparkable path (op still pending
-	 * but we're returning the raw sentinel) so the registry never retains a
-	 * pointer to this about-to-be-freed on-stack op. Idempotent when the op
-	 * was already delivered/removed.
-	 */
-	hcall_registry_del(&op);
 
 	if (resp_len)
 		*resp_len = got;

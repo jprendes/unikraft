@@ -9,12 +9,10 @@
  * See include/hyperlight-x86/poll.h for the design rationale.
  */
 
-#include <string.h>
 #include <stdio.h>
 #include <uk/arch/types.h>
 #include <uk/arch/time.h>
 #include <uk/plat/time.h>
-#include <uk/print.h>
 #include <uk/essentials.h>
 #include <uk/lcpu.h>
 #include <uk/thread.h>
