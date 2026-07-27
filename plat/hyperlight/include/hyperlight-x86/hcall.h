@@ -27,19 +27,15 @@ extern "C" {
  * The request payload is opaque to this API; convention is a JSON object
  * of the form {"name":"<tool>","args":{…}} that the host recognises.
  *
- * Under CONFIG_HYPERLIGHT_POLL the request is wrapped as
- * {"__hl_request_id":"<16 lowercase hex digits>","request":<original>} before
- * sending; the underlying u64 is a guest-allocated monotonically incrementing
- * nonzero ID (static guest memory, preserved across snapshots). The host echoes
- * the string as {"result":{"__hl_yield__":"<16 lowercase hex digits>"}} when
- * the result is not yet ready; the guest validates the returned ID matches the
- * allocated one and parks the caller until the next `poll`. The host delivers
- * completions in a batch keyed by the same fixed-width hex strings.
+ * Under CONFIG_HYPERLIGHT_POLL the request is carried in a versioned binary
+ * control frame with a guest-allocated nonzero u64 ID (static guest memory,
+ * preserved across snapshots). A pending response parks the caller until a
+ * later binary `poll` batch delivers the final JSON result for that ID.
  * hyperlight_poll_pump() routes each entry to the matching parked op (see
  * hyperlight_hcall_deliver_batch), so the caller resumes with the real result
  * without replaying the request. Parking only happens when the caller is on a
- * parkable thread inside a poll pump. A malformed or mismatched yield sentinel
- * is always a protocol error (-8), never a silent park or raw pass-through.
+ * parkable thread inside a poll pump. A malformed frame or mismatched ID is
+ * always a protocol error (-8).
  *
  * @param req          Request bytes (e.g. a JSON object).
  * @param req_len      Length of @req.
@@ -54,8 +50,8 @@ extern "C" {
  *         -5 pop from input_stack failed,
  *         -6 FlatBuffer decode failed,
  *         -7 response buffer too small,
- *         -8 (CONFIG_HYPERLIGHT_POLL) yield sentinel has a malformed or
- *            mismatched hexadecimal ID — protocol error.
+ *         -8 (CONFIG_HYPERLIGHT_POLL) malformed async control frame,
+ *            mismatched request ID, or pending result outside a poll pump.
  */
 int hyperlight_hcall(const __u8 *req, __sz req_len,
 		     __u8 *resp, __sz resp_cap, __sz *resp_len);
@@ -64,13 +60,11 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 /**
  * Deliver a batch of completed/errored host-call results to parked ops.
  *
- * @json is the JSON object the host passes as the `poll` guest function's
- * argument: {"<16-digit-hex-id>":{"result":…}|{"error":…}, …}. For every
- * registered op whose hexadecimal request_id string appears as a key,
- * the corresponding value object remains in a stable batch snapshot and the
- * matching caller is woken. Ops whose IDs are absent stay pending.
+ * @frame is the binary byte vector passed to the guest `poll` function. Each
+ * entry contains a numeric request ID and a length-delimited JSON result.
+ * Matching callers are woken; IDs absent from the batch stay pending.
  */
-void hyperlight_hcall_deliver_batch(const __u8 *json, __sz json_len);
+void hyperlight_hcall_deliver_batch(const __u8 *frame, __sz frame_len);
 #endif /* CONFIG_HYPERLIGHT_POLL */
 
 #ifdef __cplusplus

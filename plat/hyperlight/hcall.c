@@ -48,33 +48,11 @@
 #define HCALL_MAX_PAYLOAD 65536
 
 #ifdef CONFIG_HYPERLIGHT_POLL
-/* Yield/await protocol (see hyperlight_hcall and plat/hyperlight/poll.c).
- *
- * Every request is wrapped by the guest before sending:
- *   {"__hl_request_id":"<16 lowercase hex digits>",
- *    "request":<original request>}
- * The ID is a guest-allocated monotonically incrementing nonzero u64 encoded
- * as fixed-width lowercase hex and stored in static guest memory (preserved
- * across snapshots).
- *
- * When the host cannot answer immediately it returns the numeric sentinel:
- *   {"result":{"__hl_yield__":"<16 lowercase hex digits>"}}
- * where the string echoes the request ID. The guest validates the echoed ID
- * against the allocated one (a mismatch is a protocol error -8), marks the op
- * PENDING, and parks until the next host `poll`. On every poll the host passes
- * a JSON object keyed by those hex strings listing completed/errored tasks:
- *   {"000000000000002a":{"result":<value>}, …}
- *
- * hyperlight_poll_pump() feeds it to hyperlight_hcall_deliver_batch(), which
- * resolves each matching parked op in place and wakes it.
- */
-#define HCALL_YIELD_KEY      "\"__hl_yield__\""
-
-/* Fixed-width textual representation of a u64 request ID. */
-#define HCALL_ID_HEX_LEN      16
-
-/* JSON overhead for the request wrapper. Round up for headroom. */
-#define HCALL_WRAP_OVERHEAD  64
+#define HCALL_FRAME_HEADER_LEN 20
+#define HCALL_FRAME_REQUEST     1
+#define HCALL_FRAME_RESULT      2
+#define HCALL_FRAME_PENDING     3
+#define HCALL_FRAME_BATCH       4
 #endif /* CONFIG_HYPERLIGHT_POLL */
 
 /* ========================================================================
@@ -321,6 +299,14 @@ static inline void write_u64_le(__u8 *p, __u64 v)
 	p[7] = (v >> 56) & 0xFF;
 }
 
+static inline void write_u32_le(__u8 *p, __u32 v)
+{
+	p[0] = v & 0xFF;
+	p[1] = (v >> 8) & 0xFF;
+	p[2] = (v >> 16) & 0xFF;
+	p[3] = (v >> 24) & 0xFF;
+}
+
 /**
  * Push data onto a shared memory stack (output_stack).
  */
@@ -454,30 +440,13 @@ static int hyperlight_hcall_once(const __u8 *req, __sz req_len,
 }
 
 #ifdef CONFIG_HYPERLIGHT_POLL
-/* Bounded forward search for `needle` (length nlen) within `hay` (length
- * hlen). Returns a pointer to the first match or NULL. hay is not assumed to
- * be NUL-terminated, so we cannot use strstr().
- */
-static const __u8 *hcall_memmem(const __u8 *hay, __sz hlen,
-				const char *needle, __sz nlen)
-{
-	if (nlen == 0 || hlen < nlen)
-		return __NULL;
-
-	for (__sz i = 0; i + nlen <= hlen; i++) {
-		if (memcmp(hay + i, needle, nlen) == 0)
-			return hay + i;
-	}
-	return __NULL;
-}
-
 /* ------------------------------------------------------------------ *
  * Pending-op registry.
  *
  * Parked host calls register their struct hyperlight_hcall_op here
  * keyed by the op's guest-allocated request_id (nonzero u64). On each
  * host `poll`, hyperlight_poll_pump() calls hyperlight_hcall_deliver_batch()
- * with the JSON object of all completed/errored tasks; each matching op
+ * with a binary batch of completed/errored tasks; each matching op
  * is resolved in place, unregistered, and its waiting thread is woken. All
  * mutations run synchronously on the single cooperative vCPU without yielding.
  * ------------------------------------------------------------------ */
@@ -496,13 +465,11 @@ static struct hyperlight_hcall_op *hl_pending_ops;
  */
 static __u64 hl_next_request_id = 1;
 
-/* Wrapping buffer for {"__hl_request_id":<id>,"request":<req>}.
- *
- * Shared static, like hcall_encode_buf: it is filled and consumed before any
- * cooperative yield, so the "one dispatch at a time" invariant that guards
- * hcall_encode_buf covers this buffer too.
+/* Request and response framing buffers are consumed before any cooperative
+ * yield, so the single-vCPU dispatch invariant permits shared storage.
  */
-static __u8 hl_wrap_buf[HCALL_MAX_PAYLOAD + HCALL_WRAP_OVERHEAD];
+static __u8 hl_frame_req[HCALL_MAX_PAYLOAD + HCALL_FRAME_HEADER_LEN];
+static __u8 hl_frame_resp[HCALL_MAX_PAYLOAD + HCALL_FRAME_HEADER_LEN];
 
 /* Stable snapshot of the most recent poll batch. deliver_batch() copies the
  * host's poll argument here (NOT into each caller's response buffer) so the
@@ -523,15 +490,6 @@ static __noinline void hcall_registry_add(struct hyperlight_hcall_op *op)
 {
 	op->next = hl_pending_ops;
 	hl_pending_ops = op;
-}
-
-/* Encode a u64 as exactly 16 lowercase hexadecimal digits (no NUL). */
-static void hcall_id_to_hex(__u64 v, char buf[HCALL_ID_HEX_LEN])
-{
-	static const char digits[] = "0123456789abcdef";
-
-	for (__sz i = 0; i < HCALL_ID_HEX_LEN; i++)
-		buf[i] = digits[(v >> ((HCALL_ID_HEX_LEN - 1 - i) * 4)) & 0xf];
 }
 
 /* Return 1 if @id is already registered, 0 otherwise. */
@@ -560,228 +518,102 @@ static __u64 hcall_alloc_id(void)
 	return id;
 }
 
-/* Build the wrapped request in hl_wrap_buf:
- *   {"__hl_request_id":"<fixed-width-hex-id>","request":<req>}
- * Returns the total byte count, or 0 if the result does not fit.
- */
-static __sz hcall_wrap_request(__u64 id, const __u8 *req, __sz req_len)
+static void hcall_frame_write(__u8 *frame, __u8 kind, __u64 id,
+			      const __u8 *payload, __sz payload_len)
 {
-	static const char pfx[] = "{\"__hl_request_id\":\"";
-	static const char mid[] = "\",\"request\":";
-	char id_str[HCALL_ID_HEX_LEN];
-	__sz total;
-
-	hcall_id_to_hex(id, id_str);
-	/* pfx + id + mid + req + '}' */
-	total = (sizeof(pfx) - 1) + HCALL_ID_HEX_LEN +
-		(sizeof(mid) - 1) + req_len + 1;
-	if (total > sizeof(hl_wrap_buf))
-		return 0;
-
-	__sz pos = 0;
-
-	memcpy(hl_wrap_buf + pos, pfx, sizeof(pfx) - 1);
-	pos += sizeof(pfx) - 1;
-	memcpy(hl_wrap_buf + pos, id_str, HCALL_ID_HEX_LEN);
-	pos += HCALL_ID_HEX_LEN;
-	memcpy(hl_wrap_buf + pos, mid, sizeof(mid) - 1);
-	pos += sizeof(mid) - 1;
-	if (req_len > 0)
-		memcpy(hl_wrap_buf + pos, req, req_len);
-	pos += req_len;
-	hl_wrap_buf[pos++] = '}';
-	return pos;
+	memcpy(frame, "HLAF", 4);
+	frame[4] = 1;
+	frame[5] = kind;
+	frame[6] = 0;
+	frame[7] = 0;
+	write_u64_le(frame + 8, id);
+	write_u32_le(frame + 16, (__u32)payload_len);
+	if (payload_len)
+		memcpy(frame + HCALL_FRAME_HEADER_LEN, payload, payload_len);
 }
 
-/* Classify `resp` as a fixed-width hexadecimal yield sentinel and extract ID.
- *
- * Returns:
- *    1  yield sentinel; *out_id set to the decoded nonzero u64 value.
- *    0  not a yield sentinel (no "__hl_yield__" key present).
- *   -1  key present but value is not exactly 16 lowercase hex digits,
- *       decodes to zero, or is otherwise malformed — protocol error.
- *
- * Recognises {"result":{"__hl_yield__":"000000000000002a"}} and any payload
- * containing the key.
- */
-static int hcall_extract_yield_id(const __u8 *resp, __sz len, __u64 *out_id)
+static int hcall_frame_read(const __u8 *frame, __sz frame_len,
+			    __u8 *kind, __u64 *id,
+			    const __u8 **payload, __sz *payload_len)
 {
-	const __u8 *p = hcall_memmem(resp, len, HCALL_YIELD_KEY,
-				     sizeof(HCALL_YIELD_KEY) - 1);
-	const __u8 *end = resp + len;
-	__u64 v;
+	__u32 len;
 
-	if (!p)
-		return 0;
-
-	/* Advance past the key, then whitespace and ':'. */
-	p += sizeof(HCALL_YIELD_KEY) - 1;
-	while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
-		p++;
-	if (p >= end || *p != ':')
+	if (frame_len < HCALL_FRAME_HEADER_LEN ||
+	    memcmp(frame, "HLAF", 4) != 0 || frame[4] != 1 ||
+	    frame[6] != 0 || frame[7] != 0)
 		return -1;
-	p++;
-	while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
-		p++;
-
-	if (p >= end || *p++ != '"' ||
-	    (__sz)(end - p) < HCALL_ID_HEX_LEN + 1)
+	len = hl_fb_u32(frame, 16);
+	if ((__sz)len != frame_len - HCALL_FRAME_HEADER_LEN)
 		return -1;
-
-	v = 0;
-	for (__sz i = 0; i < HCALL_ID_HEX_LEN; i++) {
-		__u8 c = *p++;
-		__u64 d;
-
-		if (c >= '0' && c <= '9')
-			d = (__u64)(c - '0');
-		else if (c >= 'a' && c <= 'f')
-			d = (__u64)(c - 'a' + 10);
-		else
-			return -1;
-		v = (v << 4) | d;
-	}
-	if (*p++ != '"')
-		return -1;
-	if (p < end && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' &&
-	    *p != ',' && *p != '}')
-		return -1;
-	if (v == 0)
-		return -1; /* ID must be nonzero */
-	*out_id = v;
-	return 1;
-}
-
-/* Locate the value object for the fixed-width hex key "<id_str>" in the batch
- * object. On success sets @out and @out_len to the balanced {...}
- * value (verbatim, ready to hand back as the op's response) and returns 1;
- * returns 0 if the key is absent or the value is malformed.
- *
- * The value scan honours JSON strings and escapes so braces inside string
- * values don't throw off the brace-depth counter.
- */
-static int hcall_batch_find(const __u8 *json, __sz json_len,
-			    const __u8 *tok, __sz tok_len,
-			    const __u8 **out, __sz *out_len)
-{
-	const __u8 *end = json + json_len;
-	const __u8 *p = json;
-
-	while (p < end) {
-		const __u8 *q;
-		const __u8 *v;
-		int depth;
-		int instr;
-
-		if (*p != '"') {
-			p++;
-			continue;
-		}
-		/* Need `"` + tok + `"` to fit before end. */
-		if ((__sz)(end - (p + 1)) < tok_len + 1) {
-			p++;
-			continue;
-		}
-		if (memcmp(p + 1, tok, tok_len) != 0 ||
-		    p[1 + tok_len] != '"') {
-			p++;
-			continue;
-		}
-
-		/* Matched key "<tok>"; expect ws ':' ws '{'. */
-		q = p + 1 + tok_len + 1;
-		while (q < end && (*q == ' ' || *q == '\t' ||
-				   *q == '\n' || *q == '\r'))
-			q++;
-		if (q >= end || *q != ':') {
-			p++;
-			continue;
-		}
-		q++;
-		while (q < end && (*q == ' ' || *q == '\t' ||
-				   *q == '\n' || *q == '\r'))
-			q++;
-		if (q >= end || *q != '{')
-			return 0;
-
-		/* Scan a balanced object, honouring strings/escapes. */
-		v = q;
-		depth = 0;
-		instr = 0;
-		while (q < end) {
-			__u8 c = *q;
-
-			if (instr) {
-				if (c == '\\') {
-					q += 2;
-					continue;
-				}
-				if (c == '"')
-					instr = 0;
-				q++;
-				continue;
-			}
-			if (c == '"') {
-				instr = 1;
-				q++;
-				continue;
-			}
-			if (c == '{') {
-				depth++;
-			} else if (c == '}') {
-				depth--;
-				if (depth == 0) {
-					q++;
-					*out = v;
-					*out_len = (__sz)(q - v);
-					return 1;
-				}
-			}
-			q++;
-		}
-		return 0; /* unterminated value */
-	}
+	*kind = frame[5];
+	*id = read_u64_le(frame + 8);
+	*payload = frame + HCALL_FRAME_HEADER_LEN;
+	*payload_len = (__sz)len;
 	return 0;
 }
 
-void hyperlight_hcall_deliver_batch(const __u8 *json, __sz json_len)
+static void hcall_complete(__u64 id, const __u8 *payload, __sz payload_len)
 {
 	struct hyperlight_hcall_op **pp;
 
-	if (!json || json_len == 0)
-		return;
-
-	/* Snapshot the batch into stable kernel memory. Each matching operation
-	 * retains its value's location so its caller can copy the result after it
-	 * is woken, avoiding a second batch scan and the shared-response-buffer
-	 * clobber window (see hl_batch_buf).
-	 */
-	if (json_len > sizeof(hl_batch_buf))
-		json_len = sizeof(hl_batch_buf);
-	memcpy(hl_batch_buf, json, json_len);
-
-	/* Resolve every registered operation whose hexadecimal ID is present and
-	 * unregister it. The callers are still blocked while this list is walked.
-	 */
-	for (pp = &hl_pending_ops; *pp;) {
+	for (pp = &hl_pending_ops; *pp; pp = &(*pp)->next) {
 		struct hyperlight_hcall_op *op = *pp;
-		char id_str[HCALL_ID_HEX_LEN];
-		const __u8 *val;
-		__sz val_len;
 
-		hcall_id_to_hex(op->request_id, id_str);
-		if (!hcall_batch_find(hl_batch_buf, json_len,
-				      (const __u8 *)id_str, HCALL_ID_HEX_LEN,
-				      &val, &val_len)) {
-			pp = &op->next;
+		if (op->request_id != id)
 			continue;
-		}
-		op->completion = val;
-		op->completion_len = val_len;
+		op->completion = payload;
+		op->completion_len = payload_len;
 		*pp = op->next;
 		op->next = __NULL;
 		if (op->waiter)
 			uk_thread_wake(op->waiter);
+		return;
+	}
+}
+
+void hyperlight_hcall_deliver_batch(const __u8 *frame, __sz frame_len)
+{
+	const __u8 *payload;
+	const __u8 *p;
+	const __u8 *end;
+	__sz payload_len;
+	__u64 count;
+	__u64 ignored_id;
+	__u8 kind;
+
+	if (!frame || frame_len > sizeof(hl_batch_buf) ||
+	    hcall_frame_read(frame, frame_len, &kind, &count,
+			     &payload, &payload_len) < 0 ||
+	    kind != HCALL_FRAME_BATCH)
+		return;
+
+	/* Validate every entry before waking callers. */
+	p = payload;
+	end = payload + payload_len;
+	for (__u64 i = 0; i < count; i++) {
+		__u32 len;
+
+		if ((__sz)(end - p) < 12)
+			return;
+		ignored_id = read_u64_le(p);
+		len = hl_fb_u32(p, 8);
+		p += 12;
+		if (!ignored_id || (__sz)(end - p) < len)
+			return;
+		p += len;
+	}
+	if (p != end)
+		return;
+
+	memcpy(hl_batch_buf, frame, frame_len);
+	p = hl_batch_buf + HCALL_FRAME_HEADER_LEN;
+	for (__u64 i = 0; i < count; i++) {
+		__u64 id = read_u64_le(p);
+		__u32 len = hl_fb_u32(p, 8);
+
+		p += 12;
+		hcall_complete(id, p, (__sz)len);
+		p += len;
 	}
 }
 
@@ -795,29 +627,37 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 		.waiter = uk_thread_current(),
 	};
 	__u64 id;
-	__u64 yield_id;
-	__sz wrap_len;
+	__u64 response_id;
+	const __u8 *payload;
+	__sz payload_len;
 	__sz got = 0;
+	__u8 kind;
 	int rc;
-	int y;
 
 	id = hcall_alloc_id();
-	wrap_len = hcall_wrap_request(id, req, req_len);
-	if (!wrap_len)
+	if (req_len > HCALL_MAX_PAYLOAD)
 		return -3;
+	hcall_frame_write(hl_frame_req, HCALL_FRAME_REQUEST, id, req, req_len);
 
-	rc = hyperlight_hcall_once(hl_wrap_buf, wrap_len,
-				  resp, resp_cap, &got);
+	rc = hyperlight_hcall_once(hl_frame_req,
+				  HCALL_FRAME_HEADER_LEN + req_len,
+				  hl_frame_resp, sizeof(hl_frame_resp), &got);
 	if (rc < 0)
 		return rc;
 
-	y = hcall_extract_yield_id(resp, got, &yield_id);
-	if (y == 0) {
+	if (hcall_frame_read(hl_frame_resp, got, &kind, &response_id,
+			     &payload, &payload_len) < 0 ||
+	    response_id != id)
+		return -8;
+	if (kind == HCALL_FRAME_RESULT) {
+		if (payload_len > resp_cap)
+			return -7;
+		memcpy(resp, payload, payload_len);
 		if (resp_len)
-			*resp_len = got;
+			*resp_len = payload_len;
 		return 0;
 	}
-	if (y < 0 || yield_id != id)
+	if (kind != HCALL_FRAME_PENDING || payload_len != 0)
 		return -8;
 
 	op.request_id = id;
@@ -835,6 +675,7 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 		 */
 		UK_ASSERT(hl_pending_ops == &op);
 		hl_pending_ops = op.next;
+		return -8;
 	}
 
 	if (resp_len)

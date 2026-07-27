@@ -49,22 +49,18 @@ static struct uk_thread *hl_poll_idle_thread;
  */
 static __nsec hl_poll_wakeup_time;
 
-/* Extract the first hlstring parameter from the in-flight `poll` FunctionCall
- * and deliver it as the completed/errored-task batch to any parked host calls.
+/* Extract the first hlvecbytes parameter from the in-flight `poll`
+ * FunctionCall and deliver it as the completed-task batch.
  *
- * The host invokes the guest `poll` function with a single JSON string
- * argument: {"<request-id>":{"result":…}|{"error":…}, …} listing every async host
- * task that has completed or errored since the last poll (empty object when
- * none). hyperlight_hcall_deliver_batch() routes each entry to the matching
- * parked op. The FC bytes are the ones dispatch.c stashed for this call
- * (see hyperlight_dispatch_current_fc_*); parsing mirrors the fixed
- * FunctionCall/hlstring FlatBuffer shape used elsewhere (fb.h).
+ * The host invokes `poll` with one binary frame containing every async result
+ * ready for delivery. hyperlight_hcall_deliver_batch() validates and routes
+ * its entries. The FC bytes are the ones dispatch.c stashed for this call.
  */
 static void hyperlight_poll_deliver_arg(void)
 {
 	const __u8 *b = hyperlight_dispatch_current_fc_bytes();
 	__sz len = hyperlight_dispatch_current_fc_len();
-	__sz fc, params, p0_pos, p0, hs, s;
+	__sz fc, params, p0_pos, p0, vb, v;
 	__u16 tf;
 	__u32 slen;
 
@@ -83,23 +79,23 @@ static void hyperlight_poll_deliver_arg(void)
 	p0_pos = params + 4;
 	p0 = p0_pos + hl_fb_u32(b, p0_pos);
 
-	/* Parameter.value_type (u8 inline at VT[4]) must be hlstring (7). */
+	/* Parameter.value_type (u8 inline at VT[4]) must be hlvecbytes (9). */
 	tf = hl_fb_field(b, p0, 4);
-	if (!tf || b[p0 + tf] != HL_PV_HLSTRING)
+	if (!tf || b[p0 + tf] != HL_PV_HLVECBYTES)
 		return;
 
-	/* Parameter.value (VT[6]) -> hlstring table -> value (VT[4]) -> data. */
-	hs = hl_fb_follow(b, p0, 6);
-	if (!hs)
+	/* Parameter.value (VT[6]) -> hlvecbytes table -> value (VT[4]). */
+	vb = hl_fb_follow(b, p0, 6);
+	if (!vb)
 		return;
-	s = hl_fb_follow(b, hs, 4);
-	if (!s || s + 4 > len)
+	v = hl_fb_follow(b, vb, 4);
+	if (!v || v + 4 > len)
 		return;
-	slen = hl_fb_u32(b, s);
-	if (s + 4 + slen > len)
+	slen = hl_fb_u32(b, v);
+	if (v + 4 + slen > len)
 		return;
 
-	hyperlight_hcall_deliver_batch(b + s + 4, (__sz)slen);
+	hyperlight_hcall_deliver_batch(b + v + 4, (__sz)slen);
 }
 
 static int hyperlight_poll_current_can_park(void)
