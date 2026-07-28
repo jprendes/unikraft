@@ -461,7 +461,9 @@ struct hyperlight_hcall_op {
 static struct hyperlight_hcall_op *hl_pending_ops;
 
 /* Monotonically increasing, nonzero request-ID counter, stored in static
- * guest memory (preserved across snapshots). Skips 0 on wrap.
+ * guest memory (preserved across snapshots). A 64-bit counter cannot wrap
+ * within the lifetime of a guest, so every allocated ID is unique among the
+ * registered ops without a collision scan.
  */
 static __u64 hl_next_request_id = 1;
 
@@ -486,36 +488,10 @@ static __u8 hl_frame_resp[HCALL_MAX_PAYLOAD + HCALL_FRAME_HEADER_LEN];
  */
 static __u8 hl_batch_buf[HCALL_MAX_PAYLOAD];
 
-static __noinline void hcall_registry_add(struct hyperlight_hcall_op *op)
-{
-	op->next = hl_pending_ops;
-	hl_pending_ops = op;
-}
-
-/* Return 1 if @id is already registered, 0 otherwise. */
-static int hcall_id_in_use(__u64 id)
-{
-	struct hyperlight_hcall_op *op;
-
-	for (op = hl_pending_ops; op; op = op->next)
-		if (op->request_id == id)
-			return 1;
-	return 0;
-}
-
-/* Allocate the next unused nonzero request ID. */
+/* Allocate the next nonzero request ID. */
 static __u64 hcall_alloc_id(void)
 {
-	__u64 id;
-
-	do {
-		id = hl_next_request_id++;
-
-		if (hl_next_request_id == 0)
-			hl_next_request_id = 1;
-	} while (hcall_id_in_use(id));
-
-	return id;
+	return hl_next_request_id++;
 }
 
 static void hcall_frame_write(__u8 *frame, __u8 kind, __u64 id,
@@ -661,7 +637,8 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 		return -8;
 
 	op.request_id = id;
-	hcall_registry_add(&op);
+	op.next = hl_pending_ops;
+	hl_pending_ops = &op;
 
 	while (!op.completion && hyperlight_poll_park())
 		;
