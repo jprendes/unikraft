@@ -370,7 +370,7 @@ static int hcall_pop(__u8 *stack, __u64 stack_size,
  *
  * One shared FlatBuffer encode buffer (static; request payloads are
  * bounded by HCALL_MAX_PAYLOAD). Callers provide their own request and
- * response buffers so the API is stateless across calls — a single
+ * response buffers so the API is stateless across calls -- a single
  * thread running one dispatch at a time is the expected use.
  */
 static __u8 hcall_encode_buf[HCALL_MAX_PAYLOAD + 256];
@@ -461,9 +461,8 @@ struct hyperlight_hcall_op {
 static struct hyperlight_hcall_op *hl_pending_ops;
 
 /* Monotonically increasing, nonzero request-ID counter, stored in static
- * guest memory (preserved across snapshots). A 64-bit counter cannot wrap
- * within the lifetime of a guest, so every allocated ID is unique among the
- * registered ops without a collision scan.
+ * guest memory, so it is preserved across snapshots and keeps counting over
+ * the whole actor lineage rather than restarting per restored process.
  */
 static __u64 hl_next_request_id = 1;
 
@@ -488,9 +487,24 @@ static __u8 hl_frame_resp[HCALL_MAX_PAYLOAD + HCALL_FRAME_HEADER_LEN];
  */
 static __u8 hl_batch_buf[HCALL_MAX_PAYLOAD];
 
-/* Allocate the next nonzero request ID. */
+/* Allocate the next request ID.
+ *
+ * IDs must be unique among the currently registered ops (hcall_complete()
+ * resolves the first list entry matching an ID) and nonzero (the host rejects
+ * a zero ID as a protocol error). A bare increment satisfies both without a
+ * collision scan, because the counter cannot wrap in practice: one ID is
+ * allocated per hyperlight_hcall(), and every host call costs an outb VM exit
+ * (~1us). Exhausting 2^64 IDs would therefore take on the order of 10^5 years
+ * of uninterrupted host calls -- far beyond the lineage of any guest, even
+ * though the counter persists across snapshots.
+ *
+ * The assert makes that reasoning fail loudly rather than silently: past a
+ * wrap, a reissued ID could match a still-parked op and wake the wrong caller
+ * with another's payload, and an ID of 0 would be rejected by the host.
+ */
 static __u64 hcall_alloc_id(void)
 {
+	UK_ASSERT(hl_next_request_id != 0);
 	return hl_next_request_id++;
 }
 
@@ -678,7 +692,7 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 
 #if CONFIG_LIBDEVFS
 
-/* Static buffers — user-space device tracks the last response across
+/* Static buffers -- user-space device tracks the last response across
  * read() calls (see dev_hcall_read for the pos/len state machine).
  */
 static __u8 hcall_req_buf[HCALL_MAX_PAYLOAD];
