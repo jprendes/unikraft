@@ -857,17 +857,52 @@ static int hostsock_socketpair(struct posix_socket_driver *d __attribute__((unus
 	return -EOPNOTSUPP;
 }
 
+/*
+ * Publish the host's answer as the socket's readiness state.
+ *
+ * The host poll result is authoritative and level-triggered, so a bit that
+ * came back clear must be *cleared*, not merely left alone. Only ever setting
+ * bits latches a socket readable forever: the first time data arrives POLLIN
+ * goes up and never comes down, so poll()/epoll_wait() keep reporting the fd
+ * ready, the caller reads, hostsock_recvfrom re-checks with the host, gets
+ * "not ready" and returns EAGAIN — and round it goes. That is a livelock, and
+ * an idle connection parked in a keep-alive pool is the common way to hit it.
+ *
+ * Returns the events that are now set, so callers can tell whether this
+ * socket has anything to wake on.
+ */
+static unsigned hostsock_publish_events(posix_sock *sock, int revents)
+{
+	unsigned set = 0, clr = 0;
+
+	if (revents & 1)
+		set |= UKFD_POLLIN;
+	else
+		clr |= UKFD_POLLIN;
+
+	if (revents & 4)
+		set |= UKFD_POLLOUT;
+	else
+		clr |= UKFD_POLLOUT;
+
+	/* Clear first: a set is what wakes waiters, so raising the new edge
+	 * last avoids a spurious wake on a bit we are about to drop.
+	 */
+	if (clr)
+		posix_sock_event_clear(sock, clr);
+	if (set)
+		posix_sock_event_set(sock, set);
+
+	return set;
+}
+
 static void hostsock_poll_setup(posix_sock *sock)
 {
 	uint32_t fd = get_host_fd(sock);
 	/* POLLIN=1, POLLOUT=4 — check real readiness via host poll(). */
 	int revents = hostsock_check_ready(fd, 1 | 4);
-	unsigned events = 0;
-	if (revents & 1)
-		events |= UKFD_POLLIN;
-	if (revents & 4)
-		events |= UKFD_POLLOUT;
-	posix_sock_event_set(sock, events);
+
+	hostsock_publish_events(sock, revents);
 	hostsock_track(sock);
 }
 
@@ -879,15 +914,9 @@ int hostsock_rescan_events(void)
 		posix_sock *sock = tracked_socks[i];
 		uint32_t fd = get_host_fd(sock);
 		int revents = hostsock_check_ready(fd, 1 | 4);
-		unsigned events = 0;
-		if (revents & 1)
-			events |= UKFD_POLLIN;
-		if (revents & 4)
-			events |= UKFD_POLLOUT;
-		if (events) {
-			posix_sock_event_set(sock, events);
+
+		if (hostsock_publish_events(sock, revents))
 			woke = 1;
-		}
 	}
 	return woke;
 }
