@@ -4,6 +4,7 @@
  * You may not use this file except in compliance with the License.
  */
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <uk/plat/time.h>

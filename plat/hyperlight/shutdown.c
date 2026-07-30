@@ -6,6 +6,7 @@
 
 #include <uk/pm.h>
 #include <uk/boot.h>
+#include <uk/boot/earlytab.h>
 #include <uk/print.h>
 #include <uk/plat/common/bootinfo.h>
 
