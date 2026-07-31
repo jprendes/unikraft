@@ -331,6 +331,15 @@ static void sockaddr_to_json(const struct sockaddr *addr, socklen_t len,
 		snprintf(buf, cap,
 			 "\"family\":10,\"addr\":\"%s\",\"port\":%u",
 			 ip, ntohs(in6->sin6_port));
+	} else if (addr->sa_family == AF_UNSPEC) {
+		/* A connect() to AF_UNSPEC dissolves a datagram socket's
+		 * association. It carries no address, and the host has to
+		 * see it as such: reporting it as 0.0.0.0 would look like
+		 * an ordinary connect and silently leave the old peer and
+		 * source address in place. glibc's getaddrinfo relies on
+		 * this reset between candidate addresses.
+		 */
+		snprintf(buf, cap, "\"family\":0,\"addr\":\"\",\"port\":0");
 	} else {
 		snprintf(buf, cap,
 			 "\"family\":2,\"addr\":\"0.0.0.0\",\"port\":0");
