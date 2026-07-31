@@ -54,7 +54,14 @@ __u64 hyperlight_user_stack_top;
 typedef void (*hl_run_fn)(void);
 typedef void (*hl_dispatch_fn)(const __u8 *fc_bytes, __sz fc_len);
 
-/* Two dispatch paths coexist:
+/* Three dispatch paths coexist:
+ *
+ *   g_pump_callback:    cooperative poll pump — owns scheduler progress
+ *                       when the guest is built with
+ *                       CONFIG_HYPERLIGHT_POLL. It receives every guest
+ *                       function and routes named calls to the FC-aware
+ *                       callback from a schedulable thread, so a call
+ *                       that blocks can still yield the vCPU.
  *
  *   g_run_callback:     legacy no-args callback — used when the loaded
  *                       ELF only exposes main()/_start and runs the
@@ -69,8 +76,10 @@ typedef void (*hl_dispatch_fn)(const __u8 *fc_bytes, __sz fc_len);
  *                       ELF does its own name-based routing using the
  *                       hl_fb_* helpers in fb.h.
  *
- * If both are set, the FC-aware callback wins.
+ * The pump wins outright; otherwise the FC-aware callback wins over the
+ * legacy one.
  */
+static volatile hl_run_fn g_pump_callback;
 static volatile hl_run_fn g_run_callback;
 static volatile hl_dispatch_fn g_dispatch_callback;
 static struct hyperlight_peb g_dispatch_peb;
@@ -127,6 +136,7 @@ hl_dispatch_fn *hyperlight_dispatch_v2_slot(void)
 
 /* MSR helpers */
 #define MSR_KERNEL_GS_BASE 0xC0000102
+#define MSR_FS_BASE         0xC0000100
 #define MSR_STAR            0xC0000081
 #define MSR_LSTAR           0xC0000082
 #define MSR_SFMASK          0xC0000084
@@ -149,6 +159,36 @@ static __u64 g_saved_sfmask;
 static __u64 g_saved_kernel_gs_base;
 static __u64 g_saved_user_fsbase;
 
+/* Record the FS_BASE the application left behind and reinstate the kernel's.
+ * The saved value survives in the snapshot, so a dispatch after restore can
+ * hand the application back its own TLS.
+ */
+static void hl_dispatch_swap_to_kernel_fsbase(void)
+{
+	g_saved_user_fsbase = rdmsr(MSR_FS_BASE);
+	if (hyperlight_kernel_fsbase)
+		wrmsr(MSR_FS_BASE, hyperlight_kernel_fsbase);
+}
+
+int hyperlight_dispatch_invoke_v2(const __u8 *fc_bytes, __sz fc_len)
+{
+	hl_dispatch_fn cb = g_dispatch_callback;
+	__u64 caller_fsbase;
+
+	if (!cb)
+		return 0;
+
+	/* The callback installs the application's FS_BASE itself (it is the
+	 * only party that knows which TLS block its runtime was wired up
+	 * against). Restore ours so the caller keeps its thread-local state
+	 * whether or not the callback bothered to put FS_BASE back.
+	 */
+	caller_fsbase = rdmsr(MSR_FS_BASE);
+	cb(fc_bytes, fc_len);
+	wrmsr(MSR_FS_BASE, caller_fsbase);
+	return 1;
+}
+
 void hyperlight_dispatch_register(hl_run_fn fn) { g_run_callback = fn; }
 
 /**
@@ -161,6 +201,7 @@ void hyperlight_dispatch_register_v2(hl_dispatch_fn fn)
 {
 	g_dispatch_callback = fn;
 }
+void hyperlight_dispatch_register_pump(hl_run_fn fn) { g_pump_callback = fn; }
 void hyperlight_dispatch_init(const struct hyperlight_peb *peb) {
 	__builtin_memcpy(&g_dispatch_peb, peb, sizeof(g_dispatch_peb));
 }
@@ -348,42 +389,32 @@ hyperlight_dispatch_inner(void)
 		g_current_fc_len = 0;
 	}
 
-	/* When the v2 dispatch callback is active, the loaded ELF has
-	 * already set FS_BASE to its own TLS (glibc/musl TCB).  After
-	 * snapshot+restore the snapshot's special registers hold the
-	 * kernel FS_BASE (saved at the end of the previous dispatch),
-	 * so the v2 callback would run with the wrong FS_BASE and crash
-	 * on any TLS access (errno, locale, etc.).  Restore the user's
-	 * FS_BASE before calling the callback, then save it afterward.
+	/* Hand control to the highest-priority registered path.
+	 *
+	 * The FS_BASE dance is scoped to the FC-aware callback: the loaded
+	 * ELF has set FS_BASE to its own TLS (glibc/musl TCB), and after
+	 * snapshot+restore the snapshot's special registers hold the kernel
+	 * FS_BASE (saved at the end of the previous dispatch), so the
+	 * callback would otherwise run with the wrong FS_BASE and crash on
+	 * any TLS access (errno, locale, etc.). The saved value survives in
+	 * the snapshot so the next dispatch after restore can set it again.
+	 *
+	 * The pump is excluded deliberately: it runs entirely on kernel
+	 * thread-local state, and letting the epilogue below record its
+	 * FS_BASE would overwrite the application's saved value.
 	 */
-	if (g_dispatch_callback && g_saved_user_fsbase) {
-		__u32 lo = (__u32)g_saved_user_fsbase;
-		__u32 hi = (__u32)(g_saved_user_fsbase >> 32);
-		__asm__ volatile("wrmsr"
-				 : : "c"(0xC0000100), "a"(lo), "d"(hi));
-	}
-
-	if (g_dispatch_callback) {
-		if (peeked == 0)
+	if (g_pump_callback) {
+		g_pump_callback();
+	} else if (g_dispatch_callback) {
+		if (peeked == 0) {
+			if (g_saved_user_fsbase)
+				wrmsr(MSR_FS_BASE, g_saved_user_fsbase);
 			g_dispatch_callback(fc_bytes, fc_len);
+		}
+		hl_dispatch_swap_to_kernel_fsbase();
 	} else if (g_run_callback) {
 		g_run_callback();
-	}
-
-	/* Save the user's FS_BASE before restoring the kernel's.
-	 * This value survives in the snapshot so the next dispatch
-	 * after restore can set FS_BASE correctly for the v2 callback.
-	 */
-	{
-		__u32 lo, hi;
-		__asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000100));
-		g_saved_user_fsbase = ((__u64)hi << 32) | lo;
-	}
-	if (hyperlight_kernel_fsbase) {
-		__u32 lo = (__u32)hyperlight_kernel_fsbase;
-		__u32 hi = (__u32)(hyperlight_kernel_fsbase >> 32);
-		__asm__ volatile("wrmsr"
-				 : : "c"(0xC0000100), "a"(lo), "d"(hi));
+		hl_dispatch_swap_to_kernel_fsbase();
 	}
 
 #if CONFIG_HYPERLIGHT_SYSCALL_PROFILE

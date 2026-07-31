@@ -26,6 +26,8 @@
 
 #include <uk/arch/types.h>
 
+struct uk_thread;
+
 #if CONFIG_HYPERLIGHT_POLL
 #ifdef __cplusplus
 extern "C" {
@@ -64,6 +66,25 @@ int hyperlight_poll_halt(__nsec wakeup_time);
  * @return Non-zero if the caller was parked and resumed, otherwise zero.
  */
 int hyperlight_poll_park(void);
+
+/**
+ * Entry point of the dispatch worker thread.
+ *
+ * Named guest functions cannot run on the pump's own thread: that thread is
+ * what returns control to the host, so a call that blocked there could never
+ * yield the vCPU. app-elfloader creates one schedulable thread running this
+ * loop; the pump hands it each named FunctionCall and it invokes the
+ * application's FC-aware dispatch callback. Never returns.
+ */
+void hyperlight_poll_dispatch_worker(void);
+
+/**
+ * Nominate the thread running hyperlight_poll_dispatch_worker().
+ *
+ * Until a worker is registered, named calls are left for the application's
+ * own startup path (the first call enters through main()).
+ */
+void hyperlight_poll_set_dispatch_worker(struct uk_thread *t);
 
 #ifdef __cplusplus
 }

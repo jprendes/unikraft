@@ -44,6 +44,29 @@ void hyperlight_dispatch_register(hl_run_fn fn);
 void hyperlight_dispatch_register_v2(hl_dispatch_fn fn);
 
 /**
+ * Register the cooperative poll pump as the sole dispatch entry point.
+ *
+ * The pump outranks both callbacks above because it owns scheduler
+ * progress: every guest function — including named calls destined for the
+ * FC-aware callback — has to reach the application through a schedulable
+ * thread, or a call that blocks could never yield the vCPU back to the
+ * host. The pump inspects the in-flight FunctionCall itself and routes
+ * named calls via `hyperlight_dispatch_invoke_v2`.
+ */
+void hyperlight_dispatch_register_pump(hl_run_fn fn);
+
+/**
+ * Invoke the registered FC-aware callback, if any.
+ *
+ * The callback runs with whatever FS_BASE it installs for itself; the
+ * caller's FS_BASE is saved beforehand and restored afterwards so kernel
+ * thread-local state stays intact across the call.
+ *
+ * @return Non-zero if a callback was registered and invoked, otherwise zero.
+ */
+int hyperlight_dispatch_invoke_v2(const __u8 *fc_bytes, __sz fc_len);
+
+/**
  * The dispatch function entry point.
  * Address is returned to the host in RAX during init so the host can
  * set RIP here for each MultiUseSandbox::call().
