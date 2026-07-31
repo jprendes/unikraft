@@ -26,27 +26,17 @@ typedef void (*hl_dispatch_fn)(const __u8 *fc_bytes, __sz fc_len);
 void hyperlight_dispatch_init(const struct hyperlight_peb *peb);
 
 /**
- * Register the legacy no-args callback that dispatch invokes to run
- * the application. Called by the elfloader after loading the ELF but
- * before signaling ready. Used when the ELF exposes a classic
- * main()/_start and doesn't participate in multi-function routing.
- */
-void hyperlight_dispatch_register(hl_run_fn fn);
-
-/**
  * Register an FC-aware dispatch callback. If set, `hyperlight_dispatch_inner`
  * peeks the FunctionCall FlatBuffer off the input stack, pops the
  * stack, and invokes this callback with the raw bytes. The ELF does
  * its own name-based routing inside the callback.
- *
- * Takes precedence over `hyperlight_dispatch_register` when both are set.
  */
 void hyperlight_dispatch_register_v2(hl_dispatch_fn fn);
 
 /**
  * Register the cooperative poll pump as the sole dispatch entry point.
  *
- * The pump outranks both callbacks above because it owns scheduler
+ * The pump outranks the callback above because it owns scheduler
  * progress: every guest function — including named calls destined for the
  * FC-aware callback — has to reach the application through a schedulable
  * thread, or a call that blocks could never yield the vCPU back to the

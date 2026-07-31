@@ -63,11 +63,6 @@ typedef void (*hl_dispatch_fn)(const __u8 *fc_bytes, __sz fc_len);
  *                       callback from a schedulable thread, so a call
  *                       that blocks can still yield the vCPU.
  *
- *   g_run_callback:     legacy no-args callback — used when the loaded
- *                       ELF only exposes main()/_start and runs the
- *                       whole app from scratch on every dispatch,
- *                       ignoring the FunctionCall name.
- *
  *   g_dispatch_callback: multi-function callback — receives the raw
  *                       FunctionCall FlatBuffer bytes. The ELF exports
  *                       a `__hl_guest_dispatch(fc_bytes, fc_len)`
@@ -76,11 +71,9 @@ typedef void (*hl_dispatch_fn)(const __u8 *fc_bytes, __sz fc_len);
  *                       ELF does its own name-based routing using the
  *                       hl_fb_* helpers in fb.h.
  *
- * The pump wins outright; otherwise the FC-aware callback wins over the
- * legacy one.
+ * The pump wins outright.
  */
 static volatile hl_run_fn g_pump_callback;
-static volatile hl_run_fn g_run_callback;
 static volatile hl_dispatch_fn g_dispatch_callback;
 static struct hyperlight_peb g_dispatch_peb;
 
@@ -152,7 +145,6 @@ static inline void wrmsr(__u32 msr, __u64 val) {
 }
 
 /* Saved state from init */
-static __u64 g_elf_entry;
 static __u64 g_saved_lstar;
 static __u64 g_saved_star;
 static __u64 g_saved_sfmask;
@@ -189,8 +181,6 @@ int hyperlight_dispatch_invoke_v2(const __u8 *fc_bytes, __sz fc_len)
 	return 1;
 }
 
-void hyperlight_dispatch_register(hl_run_fn fn) { g_run_callback = fn; }
-
 /**
  * Register an FC-aware dispatch callback. The callback receives the
  * raw FunctionCall FlatBuffer bytes that the host pushed onto the input
@@ -205,8 +195,6 @@ void hyperlight_dispatch_register_pump(hl_run_fn fn) { g_pump_callback = fn; }
 void hyperlight_dispatch_init(const struct hyperlight_peb *peb) {
 	__builtin_memcpy(&g_dispatch_peb, peb, sizeof(g_dispatch_peb));
 }
-void hyperlight_dispatch_set_elf_entry(__u64 e) { g_elf_entry = e; }
-__u64 hyperlight_dispatch_get_elf_entry(void) { return g_elf_entry; }
 __u64 hyperlight_dispatch_get_saved_kernel_gs_base(void) { return g_saved_kernel_gs_base; }
 
 void hyperlight_dispatch_save_msrs(void)
@@ -411,9 +399,6 @@ hyperlight_dispatch_inner(void)
 				wrmsr(MSR_FS_BASE, g_saved_user_fsbase);
 			g_dispatch_callback(fc_bytes, fc_len);
 		}
-		hl_dispatch_swap_to_kernel_fsbase();
-	} else if (g_run_callback) {
-		g_run_callback();
 		hl_dispatch_swap_to_kernel_fsbase();
 	}
 

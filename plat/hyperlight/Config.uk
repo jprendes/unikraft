@@ -58,8 +58,8 @@ config HYPERLIGHT_HCALL
 	  dispatch protocol.
 
 config HYPERLIGHT_POLL
-	bool "Enable cooperative poll execution model"
-	default n
+	bool
+	default y
 	depends on LIBUKSCHED && LIBUKSCHEDCOOP
 	select HYPERLIGHT_HCALL
 	help
@@ -70,5 +70,12 @@ config HYPERLIGHT_POLL
 	  vCPU whenever it has no runnable work, instead of running a
 	  single guest function to completion. Requires the in-kernel
 	  host-call API (HYPERLIGHT_HCALL) to report the deadline.
+
+	  This is how applications run on Hyperlight; there is no
+	  alternative execution model. It has no prompt so it cannot be
+	  turned off, but it still depends on a cooperative scheduler, and
+	  kconfig disables an option whose dependencies are unmet without
+	  saying so — app-elfloader turns that into a build error rather
+	  than a kernel that cannot launch its application.
 
 endif
