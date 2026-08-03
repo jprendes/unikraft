@@ -80,15 +80,11 @@ static __sz hl_poll_fc_root(const __u8 *b, __sz len)
 	return (fc < len) ? fc : 0;
 }
 
-/* True if the in-flight FunctionCall is the scheduler pump entry point. */
-static int hl_poll_fc_is_pump(const __u8 *b, __sz len)
+/* True if the FunctionCall rooted at @fc is the scheduler pump entry point. */
+static int hl_poll_fc_is_pump(const __u8 *b, __sz len, __sz fc)
 {
-	__sz fc = hl_poll_fc_root(b, len);
 	__sz name;
 	__u32 nlen;
-
-	if (!fc)
-		return 0;
 
 	/* FunctionCall.function_name is a string at VT[4]. */
 	name = hl_fb_follow(b, fc, 4);
@@ -177,24 +173,18 @@ void hyperlight_poll_dispatch_worker(void)
 	}
 }
 
-/* Extract the first hlvecbytes parameter from the in-flight `poll`
- * FunctionCall and deliver it as the completed-task batch.
+/* Extract the first hlvecbytes parameter from the `poll` FunctionCall rooted
+ * at @fc and deliver it as the completed-task batch.
  *
  * The host invokes `poll` with one binary frame containing every async result
  * ready for delivery. hyperlight_hcall_deliver_batch() validates and routes
  * its entries. The FC bytes are the ones dispatch.c stashed for this call.
  */
-static void hyperlight_poll_deliver_arg(const __u8 *b, __sz len)
+static void hyperlight_poll_deliver_arg(const __u8 *b, __sz len, __sz fc)
 {
-	__sz fc, params, p0_pos, p0, vb, v;
+	__sz params, p0_pos, p0, vb, v;
 	__u16 tf;
 	__u32 slen;
-
-	if (!b || len < 8)
-		return;
-
-	/* Root table (size-prefixed buffer: root offset at byte 4). */
-	fc = 4 + hl_fb_u32(b, 4);
 
 	/* parameters vector at VT[6] on FunctionCall. */
 	params = hl_fb_follow(b, fc, 6);
@@ -224,47 +214,40 @@ static void hyperlight_poll_deliver_arg(const __u8 *b, __sz len)
 	hyperlight_hcall_deliver_batch(b + v + 4, (__sz)slen);
 }
 
-static int hyperlight_poll_current_can_park(void)
+/* The calling thread, if it can be parked in the guest scheduler.
+ *
+ * Parking is only safe while a pump is driving the scheduler, and never for
+ * the pump's own host thread: that is the thread which returns control to the
+ * host, so blocking it would deadlock the pump.
+ */
+static struct uk_thread *hyperlight_poll_parkable_current(void)
 {
-	struct uk_thread *current;
+	struct uk_thread *current = uk_thread_current();
 
-	/* Only safe while a pump is driving the scheduler, and only for a
-	 * schedulable thread other than the pump's own host thread (parking
-	 * the host thread would deadlock the pump — it is what returns control
-	 * to the host).
-	 */
-	if (!hl_poll_host_thread)
-		return 0;
+	if (!hl_poll_host_thread || current == hl_poll_host_thread)
+		return __NULL;
 
-	current = uk_thread_current();
-	if (!current || current == hl_poll_host_thread)
-		return 0;
-
-	return 1;
-}
-
-static int hyperlight_poll_idle_return(__nsec wakeup_time)
-{
-	if (!hl_poll_host_thread ||
-	    uk_thread_current() != hl_poll_idle_thread)
-		return 0;
-
-	hl_poll_wakeup_time = wakeup_time;
-	uk_sched_thread_switch(hl_poll_host_thread);
-	return 1;
+	return current;
 }
 
 int hyperlight_poll_halt(__nsec wakeup_time)
 {
 	struct uk_thread *current;
 
-	if (hyperlight_poll_idle_return(wakeup_time))
+	/* The idle thread reaching a halt means the run queue has drained:
+	 * record its deadline and hand the vCPU back to the host.
+	 */
+	if (hl_poll_host_thread &&
+	    uk_thread_current() == hl_poll_idle_thread) {
+		hl_poll_wakeup_time = wakeup_time;
+		uk_sched_thread_switch(hl_poll_host_thread);
 		return 1;
-	if (!wakeup_time || !hyperlight_poll_current_can_park())
+	}
+
+	current = hyperlight_poll_parkable_current();
+	if (!wakeup_time || !current)
 		return 0;
 
-	current = uk_thread_current();
-	UK_ASSERT(current);
 	uk_thread_block_until(current, wakeup_time);
 	uk_sched_yield();
 	return 1;
@@ -272,10 +255,11 @@ int hyperlight_poll_halt(__nsec wakeup_time)
 
 int hyperlight_poll_park(void)
 {
-	struct uk_thread *current = uk_thread_current();
+	struct uk_thread *current = hyperlight_poll_parkable_current();
 
-	if (!hyperlight_poll_current_can_park())
+	if (!current)
 		return 0;
+
 	uk_thread_block(current);
 	uk_sched_yield();
 	return 1;
@@ -321,6 +305,7 @@ void hyperlight_poll_pump(void)
 	struct uk_thread *idle;
 	__nsec wakeup_time;
 	__nsec now;
+	__sz fc_root;
 	__u64 ns;
 	unsigned long flags;
 	int call_done;
@@ -365,8 +350,9 @@ void hyperlight_poll_pump(void)
 	 * completed host calls; any other name is an application-level call
 	 * that the dispatch worker runs on the scheduler.
 	 */
-	if (hl_poll_fc_is_pump(fc, fc_len))
-		hyperlight_poll_deliver_arg(fc, fc_len);
+	fc_root = hl_poll_fc_root(fc, fc_len);
+	if (fc_root && hl_poll_fc_is_pump(fc, fc_len, fc_root))
+		hyperlight_poll_deliver_arg(fc, fc_len, fc_root);
 	else
 		hl_poll_route_call(fc, fc_len);
 

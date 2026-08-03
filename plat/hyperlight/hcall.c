@@ -39,21 +39,17 @@
 #include <hyperlight-x86/outb.h>
 #include <hyperlight-x86/hcall.h>
 #include <hyperlight-x86/fb.h>
-#ifdef CONFIG_HYPERLIGHT_POLL
 #include <hyperlight-x86/poll.h>
 #include <uk/thread.h>
-#endif
 
 /* Maximum payload size for host calls */
 #define HCALL_MAX_PAYLOAD 65536
 
-#ifdef CONFIG_HYPERLIGHT_POLL
 #define HCALL_FRAME_HEADER_LEN 20
 #define HCALL_FRAME_REQUEST     1
 #define HCALL_FRAME_RESULT      2
 #define HCALL_FRAME_PENDING     3
 #define HCALL_FRAME_BATCH       4
-#endif /* CONFIG_HYPERLIGHT_POLL */
 
 /* ========================================================================
  * FlatBuffer Encoder
@@ -439,7 +435,6 @@ static int hyperlight_hcall_once(const __u8 *req, __sz req_len,
 	return 0;
 }
 
-#ifdef CONFIG_HYPERLIGHT_POLL
 /* ------------------------------------------------------------------ *
  * Pending-op registry.
  *
@@ -607,12 +602,9 @@ void hyperlight_hcall_deliver_batch(const __u8 *frame, __sz frame_len)
 	}
 }
 
-#endif /* CONFIG_HYPERLIGHT_POLL */
-
 int hyperlight_hcall(const __u8 *req, __sz req_len,
 		     __u8 *resp, __sz resp_cap, __sz *resp_len)
 {
-#ifdef CONFIG_HYPERLIGHT_POLL
 	struct hyperlight_hcall_op op = {
 		.waiter = uk_thread_current(),
 	};
@@ -672,14 +664,6 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 	if (resp_len)
 		*resp_len = got;
 	return 0;
-#else /* !CONFIG_HYPERLIGHT_POLL */
-	__sz got = 0;
-	int rc = hyperlight_hcall_once(req, req_len, resp, resp_cap, &got);
-
-	if (resp_len)
-		*resp_len = got;
-	return rc;
-#endif /* CONFIG_HYPERLIGHT_POLL */
 }
 
 /* ========================================================================

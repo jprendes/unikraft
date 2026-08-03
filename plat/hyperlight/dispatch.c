@@ -54,14 +54,13 @@ __u64 hyperlight_user_stack_top;
 typedef void (*hl_run_fn)(void);
 typedef void (*hl_dispatch_fn)(const __u8 *fc_bytes, __sz fc_len);
 
-/* Three dispatch paths coexist:
+/* Two dispatch paths coexist:
  *
- *   g_pump_callback:    cooperative poll pump — owns scheduler progress
- *                       when the guest is built with
- *                       CONFIG_HYPERLIGHT_POLL. It receives every guest
- *                       function and routes named calls to the FC-aware
- *                       callback from a schedulable thread, so a call
- *                       that blocks can still yield the vCPU.
+ *   g_pump_callback:    cooperative poll pump — owns scheduler progress.
+ *                       It receives every guest function and routes named
+ *                       calls to the FC-aware callback from a schedulable
+ *                       thread, so a call that blocks can still yield the
+ *                       vCPU.
  *
  *   g_dispatch_callback: multi-function callback — receives the raw
  *                       FunctionCall FlatBuffer bytes. The ELF exports

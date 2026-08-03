@@ -27,10 +27,10 @@ extern "C" {
  * The request payload is opaque to this API; convention is a JSON object
  * of the form {"name":"<tool>","args":{…}} that the host recognises.
  *
- * Under CONFIG_HYPERLIGHT_POLL the request is carried in a versioned binary
- * control frame with a guest-allocated nonzero u64 ID (static guest memory,
- * preserved across snapshots). A pending response parks the caller until a
- * later binary `poll` batch delivers the final JSON result for that ID.
+ * The request is carried in a versioned binary control frame with a
+ * guest-allocated nonzero u64 ID (static guest memory, preserved across
+ * snapshots). A pending response parks the caller until a later binary `poll`
+ * batch delivers the final JSON result for that ID.
  * hyperlight_poll_pump() routes each entry to the matching parked op (see
  * hyperlight_hcall_deliver_batch), so the caller resumes with the real result
  * without replaying the request. Parking only happens when the caller is on a
@@ -50,13 +50,12 @@ extern "C" {
  *         -5 pop from input_stack failed,
  *         -6 FlatBuffer decode failed,
  *         -7 response buffer too small,
- *         -8 (CONFIG_HYPERLIGHT_POLL) malformed async control frame,
- *            mismatched request ID, or pending result outside a poll pump.
+ *         -8 malformed async control frame, mismatched request ID,
+ *            or pending result outside a poll pump.
  */
 int hyperlight_hcall(const __u8 *req, __sz req_len,
 		     __u8 *resp, __sz resp_cap, __sz *resp_len);
 
-#ifdef CONFIG_HYPERLIGHT_POLL
 /**
  * Deliver a batch of completed/errored host-call results to parked ops.
  *
@@ -65,7 +64,6 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
  * Matching callers are woken; IDs absent from the batch stay pending.
  */
 void hyperlight_hcall_deliver_batch(const __u8 *frame, __sz frame_len);
-#endif /* CONFIG_HYPERLIGHT_POLL */
 
 #ifdef __cplusplus
 }

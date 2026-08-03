@@ -28,7 +28,6 @@
 
 struct uk_thread;
 
-#if CONFIG_HYPERLIGHT_POLL
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -36,9 +35,9 @@ extern "C" {
 /**
  * Drive the scheduler until it would go idle, then return.
  *
- * Registered as the Hyperlight dispatch run-callback in poll mode (see
- * app-elfloader main.c). Called from hyperlight_dispatch_inner() on every
- * `poll` guest-function invocation. Switches into the scheduler so that
+ * Registered as the Hyperlight dispatch pump callback (see app-elfloader
+ * main.c). Called from hyperlight_dispatch_inner() on every `poll`
+ * guest-function invocation. Switches into the scheduler so that
  * runnable threads execute cooperatively. When the run queue drains, the
  * idle thread's normal timed or untimed platform halt operation switches
  * back here. Before returning, the pump reports the next-wakeup deadline
@@ -52,7 +51,7 @@ void hyperlight_poll_pump(void);
  * The pump's idle thread returns to the host with @wakeup_time as its next
  * deadline. For a nonzero deadline, an application thread is instead parked
  * in the guest scheduler until that time. Outside a poll pump the halt is not
- * handled and the caller must use its legacy path.
+ * handled and the caller must halt the vCPU itself.
  *
  * @param wakeup_time    Absolute monotonic-clock deadline of the next
  *                       sleeping thread, or 0 if none.
@@ -89,15 +88,5 @@ void hyperlight_poll_set_dispatch_worker(struct uk_thread *t);
 #ifdef __cplusplus
 }
 #endif
-#else /* !CONFIG_HYPERLIGHT_POLL */
-/* Keep poll-versus-legacy decisions inside the Hyperlight platform. Callers
- * use these hooks unconditionally; non-poll builds compile them away.
- */
-static inline int hyperlight_poll_halt(__nsec wakeup_time)
-{
-	(void)wakeup_time;
-	return 0;
-}
-#endif /* CONFIG_HYPERLIGHT_POLL */
 
 #endif /* __HYPERLIGHT_X86_POLL_H__ */
