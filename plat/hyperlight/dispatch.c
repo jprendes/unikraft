@@ -54,23 +54,15 @@ __u64 hyperlight_user_stack_top;
 typedef void (*hl_run_fn)(void);
 typedef void (*hl_dispatch_fn)(const __u8 *fc_bytes, __sz fc_len);
 
-/* Two dispatch paths coexist:
+/* The cooperative poll pump is the sole dispatch entry point. app-elfloader
+ * registers it during boot and it receives every guest function, driving the
+ * unikernel scheduler so that a call which blocks can still yield the vCPU.
  *
- *   g_pump_callback:    cooperative poll pump — owns scheduler progress.
- *                       It receives every guest function and routes named
- *                       calls to the FC-aware callback from a schedulable
- *                       thread, so a call that blocks can still yield the
- *                       vCPU.
- *
- *   g_dispatch_callback: multi-function callback — receives the raw
- *                       FunctionCall FlatBuffer bytes. The ELF exports
- *                       a `__hl_guest_dispatch(fc_bytes, fc_len)`
- *                       symbol, app-elfloader finds it and registers
- *                       it via hyperlight_dispatch_register_v2(); the
- *                       ELF does its own name-based routing using the
- *                       hl_fb_* helpers in fb.h.
- *
- * The pump wins outright.
+ * Named calls are routed on from there to g_dispatch_callback: the loaded
+ * ELF exports a `__hl_guest_dispatch(fc_bytes, fc_len)` symbol and does its
+ * own name-based routing using the hl_fb_* helpers in fb.h. It is installed
+ * by the ELF writing through hyperlight_dispatch_v2_slot(), and invoked via
+ * hyperlight_dispatch_invoke_v2().
  */
 static volatile hl_run_fn g_pump_callback;
 static volatile hl_dispatch_fn g_dispatch_callback;
@@ -117,8 +109,7 @@ __sz *hyperlight_dispatch_fc_len_slot(void)
  * user-mode driver ELF can install itself as the post-first-call
  * handler without needing kernel-symbol linkage. The driver just
  * writes its own function pointer into `*slot` from its main() and
- * every subsequent dispatch goes through that callback instead of
- * the legacy deferred_run path. See
+ * every subsequent named call is routed to it by the pump. See
  * examples/python-agent-driver/hl_pydriver.c for a user.
  */
 hl_dispatch_fn *hyperlight_dispatch_v2_slot(void)
@@ -148,18 +139,6 @@ static __u64 g_saved_lstar;
 static __u64 g_saved_star;
 static __u64 g_saved_sfmask;
 static __u64 g_saved_kernel_gs_base;
-static __u64 g_saved_user_fsbase;
-
-/* Record the FS_BASE the application left behind and reinstate the kernel's.
- * The saved value survives in the snapshot, so a dispatch after restore can
- * hand the application back its own TLS.
- */
-static void hl_dispatch_swap_to_kernel_fsbase(void)
-{
-	g_saved_user_fsbase = rdmsr(MSR_FS_BASE);
-	if (hyperlight_kernel_fsbase)
-		wrmsr(MSR_FS_BASE, hyperlight_kernel_fsbase);
-}
 
 int hyperlight_dispatch_invoke_v2(const __u8 *fc_bytes, __sz fc_len)
 {
@@ -359,8 +338,8 @@ hyperlight_dispatch_inner(void)
 	/* Peek the FunctionCall bytes first. hl_buffer_pop() rewinds the
 	 * stack pointer but doesn't overwrite the bytes themselves, so
 	 * the pointer we record here stays valid throughout the callback.
-	 * Both dispatch paths benefit: v2 gets them as args, legacy can
-	 * fetch them through hyperlight_dispatch_current_fc_*().
+	 * The pump reads them back through hyperlight_dispatch_current_fc_*()
+	 * to decide how to route the call.
 	 */
 	const __u8 *fc_bytes = NULL;
 	__sz fc_len = 0;
@@ -376,30 +355,17 @@ hyperlight_dispatch_inner(void)
 		g_current_fc_len = 0;
 	}
 
-	/* Hand control to the highest-priority registered path.
+	/* Hand control to the cooperative poll pump.
 	 *
-	 * The FS_BASE dance is scoped to the FC-aware callback: the loaded
-	 * ELF has set FS_BASE to its own TLS (glibc/musl TCB), and after
-	 * snapshot+restore the snapshot's special registers hold the kernel
-	 * FS_BASE (saved at the end of the previous dispatch), so the
-	 * callback would otherwise run with the wrong FS_BASE and crash on
-	 * any TLS access (errno, locale, etc.). The saved value survives in
-	 * the snapshot so the next dispatch after restore can set it again.
-	 *
-	 * The pump is excluded deliberately: it runs entirely on kernel
-	 * thread-local state, and letting the epilogue below record its
-	 * FS_BASE would overwrite the application's saved value.
+	 * The pump is the only dispatch entry point: app-elfloader registers it
+	 * during boot, before the host can issue a guest function, and every
+	 * call -- including named ones bound for the application's FC-aware
+	 * callback -- reaches the application through it. See
+	 * hyperlight_dispatch_invoke_v2(), which owns the FS_BASE handover to
+	 * that callback.
 	 */
-	if (g_pump_callback) {
+	if (g_pump_callback)
 		g_pump_callback();
-	} else if (g_dispatch_callback) {
-		if (peeked == 0) {
-			if (g_saved_user_fsbase)
-				wrmsr(MSR_FS_BASE, g_saved_user_fsbase);
-			g_dispatch_callback(fc_bytes, fc_len);
-		}
-		hl_dispatch_swap_to_kernel_fsbase();
-	}
 
 #if CONFIG_HYPERLIGHT_SYSCALL_PROFILE
 	/* Dump syscall profile at the end of every dispatch. Only compiled

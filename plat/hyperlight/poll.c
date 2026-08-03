@@ -112,8 +112,10 @@ static void hl_poll_route_call(const __u8 *b, __sz len)
 		return;
 
 	/* Before the application registers a handler its own startup path owns
-	 * the call: the first guest function is what runs main(). Routing it
-	 * would report a completion nobody performed.
+	 * the call: the first guest function is what runs main(), and that path
+	 * reads the in-flight bytes straight out of the FC slots. Handing them
+	 * to the worker instead would swallow the call -- the worker has no
+	 * callback to invoke yet, so nobody would serve it.
 	 */
 	if (!*hyperlight_dispatch_v2_slot())
 		return;
@@ -310,22 +312,17 @@ void hyperlight_poll_pump(void)
 	unsigned long flags;
 	int call_done;
 
-	if (unlikely(!s)) {
-		/* No scheduler to drive: report "no timer" so the host does
-		 * not busy-loop, and let the application signal completion
-		 * via __hl_exit.
-		 */
-		hyperlight_poll_report(0, 0);
-		return;
-	}
-
 	/* Fetch the scheduler idle thread via the generic sched op accessor
 	 * (dispatches through the registered idle_thread callback). The const
 	 * is dropped because uk_sched_thread_switch() needs a mutable handle;
 	 * the idle thread object is legitimately mutable.
 	 */
-	idle = (struct uk_thread *)uk_sched_idle_thread(s, 0);
+	idle = s ? (struct uk_thread *)uk_sched_idle_thread(s, 0) : __NULL;
 	if (unlikely(!idle)) {
+		/* No scheduler to drive: report "no timer" so the host does
+		 * not busy-loop, and let the application signal completion
+		 * via __hl_exit.
+		 */
 		hyperlight_poll_report(0, 0);
 		return;
 	}

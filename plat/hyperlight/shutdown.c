@@ -56,8 +56,9 @@ static int hyperlight_crash(void)
 #ifdef CONFIG_HYPERLIGHT_HCALL
 static void hyperlight_halt_irq(void)
 {
-	/* Let only the idle thread driven by a poll pump yield back to it.
-	 * In non-poll builds the hook compiles to a no-op.
+	/* Only the idle thread of an active pump yields back to the host here.
+	 * Every other halt -- notably during boot, before the first pump --
+	 * falls through to the timed host sleep.
 	 */
 	if (hyperlight_poll_halt(0))
 		return;

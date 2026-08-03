@@ -46,6 +46,8 @@
 #define HCALL_MAX_PAYLOAD 65536
 
 #define HCALL_FRAME_HEADER_LEN 20
+/* Per-entry header inside a batch frame: u64 request ID + u32 payload len. */
+#define HCALL_BATCH_ENTRY_LEN  12
 #define HCALL_FRAME_REQUEST     1
 #define HCALL_FRAME_RESULT      2
 #define HCALL_FRAME_PENDING     3
@@ -563,7 +565,7 @@ void hyperlight_hcall_deliver_batch(const __u8 *frame, __sz frame_len)
 	const __u8 *end;
 	__sz payload_len;
 	__u64 count;
-	__u64 ignored_id;
+	__u64 entry_id;
 	__u8 kind;
 
 	if (!frame || frame_len > sizeof(hl_batch_buf) ||
@@ -572,18 +574,21 @@ void hyperlight_hcall_deliver_batch(const __u8 *frame, __sz frame_len)
 	    kind != HCALL_FRAME_BATCH)
 		return;
 
-	/* Validate every entry before waking callers. */
+	/* Validate every entry before waking any caller: a batch that turns out
+	 * to be malformed half way through must not have already resolved the
+	 * ops it did parse.
+	 */
 	p = payload;
 	end = payload + payload_len;
 	for (__u64 i = 0; i < count; i++) {
 		__u32 len;
 
-		if ((__sz)(end - p) < 12)
+		if ((__sz)(end - p) < HCALL_BATCH_ENTRY_LEN)
 			return;
-		ignored_id = read_u64_le(p);
+		entry_id = read_u64_le(p);
 		len = hl_fb_u32(p, 8);
-		p += 12;
-		if (!ignored_id || (__sz)(end - p) < len)
+		p += HCALL_BATCH_ENTRY_LEN;
+		if (!entry_id || (__sz)(end - p) < len)
 			return;
 		p += len;
 	}
@@ -596,7 +601,7 @@ void hyperlight_hcall_deliver_batch(const __u8 *frame, __sz frame_len)
 		__u64 id = read_u64_le(p);
 		__u32 len = hl_fb_u32(p, 8);
 
-		p += 12;
+		p += HCALL_BATCH_ENTRY_LEN;
 		hcall_complete(id, p, (__sz)len);
 		p += len;
 	}
@@ -616,9 +621,9 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 	__u8 kind;
 	int rc;
 
-	id = hcall_alloc_id();
 	if (req_len > HCALL_MAX_PAYLOAD)
 		return -3;
+	id = hcall_alloc_id();
 	hcall_frame_write(hl_frame_req, HCALL_FRAME_REQUEST, id, req, req_len);
 
 	rc = hyperlight_hcall_once(hl_frame_req,
@@ -649,10 +654,7 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 	while (!op.completion && hyperlight_poll_park())
 		;
 
-	if (op.completion) {
-		got = MIN(op.completion_len, resp_cap);
-		memcpy(resp, op.completion, got);
-	} else {
+	if (!op.completion) {
 		/* No park means no yield since insertion, so this is still the
 		 * registry head.
 		 */
@@ -661,6 +663,8 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 		return -8;
 	}
 
+	got = MIN(op.completion_len, resp_cap);
+	memcpy(resp, op.completion, got);
 	if (resp_len)
 		*resp_len = got;
 	return 0;

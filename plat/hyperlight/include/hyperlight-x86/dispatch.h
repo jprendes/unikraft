@@ -89,9 +89,8 @@ __sz *hyperlight_dispatch_fc_len_slot(void);
 /**
  * Address of the FC-aware dispatch callback pointer. A user-mode
  * driver writes its own function into `*slot` during its one-time
- * init (from the initial deferred_run / main() dispatch). Every
- * subsequent call goes through that callback, bypassing the legacy
- * deferred-main path entirely.
+ * init, which runs from main() on the application thread. Every
+ * subsequent named call is routed to that callback by the pump.
  */
 hl_dispatch_fn *hyperlight_dispatch_v2_slot(void);
 

@@ -46,8 +46,7 @@ config HYPERLIGHT_SYSCALL_PROFILE
 	  the user-visible output — keep off for production images.
 
 config HYPERLIGHT_HCALL
-	bool "Enable in-kernel host function call API"
-	default n
+	bool
 	help
 	  Build the in-kernel hyperlight_hcall() primitive that issues
 	  synchronous Hyperlight __dispatch host function calls. Kernel
@@ -56,6 +55,10 @@ config HYPERLIGHT_HCALL
 	  When LIBDEVFS is also enabled, a /dev/hcall device is registered
 	  so user-space can call host-registered functions via the same
 	  dispatch protocol.
+
+	  Selected by HYPERLIGHT_POLL, which every Hyperlight image builds,
+	  so this has no prompt: offering the choice would be a lie, since
+	  kconfig silently reinstates a selected symbol.
 
 config HYPERLIGHT_POLL
 	bool

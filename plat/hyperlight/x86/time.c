@@ -127,9 +127,9 @@ extern int hostsock_rescan_events(void);
  */
 void time_block_until(__snsec until)
 {
-	/* Poll builds either return the idle thread to the host or park an
-	 * application thread in the scheduler. In non-poll builds this hook is
-	 * an inline no-op and execution continues into the legacy host sleep.
+	/* Under an active pump this either hands the vCPU back to the host (the
+	 * idle thread) or parks an application thread in the scheduler. There
+	 * is no pump during boot, so fall through to the host sleep below.
 	 */
 	if (hyperlight_poll_halt((__nsec)until))
 		return;
