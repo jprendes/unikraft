@@ -66,16 +66,16 @@ config HYPERLIGHT_POLL
 	select LIBUKSCHEDCOOP
 	select HYPERLIGHT_HCALL
 	help
-	  Add a `poll` guest function that runs the unikernel scheduler
-	  until it would go idle, then exits the VM back to the host with
-	  a next-wakeup deadline. The host repeatedly invokes `poll` to
-	  drive execution forward. This lets a long-lived guest yield the
-	  vCPU whenever it has no runnable work, instead of running a
-	  single guest function to completion.
+	  Add a `poll` guest function that runs the unikernel scheduler until
+	  it would go idle, then exits the VM back to the host with a
+	  next-wakeup deadline. The host repeatedly invokes `poll` to drive
+	  execution forward, letting a long-lived guest yield the vCPU
+	  whenever it has no runnable work instead of running a single guest
+	  function to completion.
 
-	  This is how applications run on Hyperlight; there is no
-	  alternative execution model, so the option has no prompt and
-	  pulls in what it needs: a cooperative scheduler to run threads
-	  on and the in-kernel host-call API to report the deadline.
+	  This is how applications run on Hyperlight; there is no alternative
+	  execution model, so the option has no prompt and pulls in what it
+	  needs: a cooperative scheduler to run threads on and the in-kernel
+	  host-call API to report the deadline.
 
 endif

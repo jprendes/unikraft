@@ -36,23 +36,22 @@ void hyperlight_dispatch_register_v2(hl_dispatch_fn fn);
 /**
  * Register the cooperative poll pump as the sole dispatch entry point.
  *
- * The pump outranks the callback above because it owns scheduler
- * progress: every guest function — including named calls destined for the
- * FC-aware callback — has to reach the application through a schedulable
- * thread, or a call that blocks could never yield the vCPU back to the
- * host. The pump inspects the in-flight FunctionCall itself and routes
- * named calls via `hyperlight_dispatch_invoke_v2`.
+ * The pump outranks the callback above because it owns scheduler progress:
+ * every guest function -- including named calls destined for the FC-aware
+ * callback -- must reach the application through a schedulable thread, or a
+ * call that blocks could never yield the vCPU back to the host. The pump
+ * inspects the in-flight FunctionCall itself and routes named calls via
+ * `hyperlight_dispatch_invoke_v2`.
  */
 void hyperlight_dispatch_register_pump(hl_run_fn fn);
 
 /**
  * Invoke the registered FC-aware callback, if any.
  *
- * The callback runs with whatever FS_BASE it installs for itself; the
- * caller's FS_BASE is saved beforehand and restored afterwards so kernel
- * thread-local state stays intact across the call.
+ * The callback runs with whatever FS_BASE it installs for itself; the caller's
+ * is saved and restored around the call so kernel thread-local state survives.
  *
- * @return Non-zero if a callback was registered and invoked, otherwise zero.
+ * @return Non-zero if a callback was registered and invoked.
  */
 int hyperlight_dispatch_invoke_v2(const __u8 *fc_bytes, __sz fc_len);
 

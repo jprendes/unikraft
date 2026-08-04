@@ -27,15 +27,13 @@ extern "C" {
  * The request payload is opaque to this API; convention is a JSON object
  * of the form {"name":"<tool>","args":{…}} that the host recognises.
  *
- * The request is carried in a versioned binary control frame with a
+ * The request travels in a versioned binary control frame tagged with a
  * guest-allocated nonzero u64 ID (static guest memory, preserved across
  * snapshots). A pending response parks the caller until a later binary `poll`
- * batch delivers the final JSON result for that ID.
- * hyperlight_poll_pump() routes each entry to the matching parked op (see
- * hyperlight_hcall_deliver_batch), so the caller resumes with the real result
- * without replaying the request. Parking only happens when the caller is on a
- * parkable thread inside a poll pump. A malformed frame or mismatched ID is
- * always a protocol error (-8).
+ * batch delivers the final JSON result for that ID (see
+ * hyperlight_hcall_deliver_batch), so it resumes with the real result without
+ * replaying the request. Parking requires a parkable thread inside a poll
+ * pump. A malformed frame or mismatched ID is always a protocol error (-8).
  *
  * @param req          Request bytes (e.g. a JSON object).
  * @param req_len      Length of @req.

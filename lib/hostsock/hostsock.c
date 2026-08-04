@@ -329,12 +329,11 @@ static void sockaddr_to_json(const struct sockaddr *addr, socklen_t len,
 			 "\"family\":10,\"addr\":\"%s\",\"port\":%u",
 			 ip, ntohs(in6->sin6_port));
 	} else if (addr->sa_family == AF_UNSPEC) {
-		/* A connect() to AF_UNSPEC dissolves a datagram socket's
-		 * association. It carries no address, and the host has to
-		 * see it as such: reporting it as 0.0.0.0 would look like
-		 * an ordinary connect and silently leave the old peer and
-		 * source address in place. glibc's getaddrinfo relies on
-		 * this reset between candidate addresses.
+		/* connect() to AF_UNSPEC dissolves a datagram socket's
+		 * association and carries no address; the host must see it as
+		 * such, since reporting 0.0.0.0 would look like an ordinary
+		 * connect and silently keep the old peer and source address.
+		 * glibc's getaddrinfo relies on this reset between candidates.
 		 */
 		snprintf(buf, cap, "\"family\":0,\"addr\":\"\",\"port\":0");
 	} else {
@@ -643,12 +642,11 @@ static ssize_t hostsock_recvfrom(posix_sock *sock,
 
 	/*
 	 * Check readiness before submitting recv. If no data is available,
-	 * return EAGAIN so the blocking posix-socket recvfrom/recvmsg wrappers
-	 * wait via uk_file_poll() and retry, while non-blocking calls return
-	 * immediately. This integrates socket waiting with the cooperative
-	 * scheduler instead of leaving a recv host call pending. Blocking
-	 * semantics are owned by the descriptor's O_NONBLOCK mode in the
-	 * posix-socket layer. This mirrors hostsock_accept4.
+	 * return EAGAIN so the blocking posix-socket wrappers wait via
+	 * uk_file_poll() and retry while non-blocking calls return at once.
+	 * That integrates socket waiting with the cooperative scheduler
+	 * instead of leaving a recv host call pending, and leaves blocking
+	 * semantics to the descriptor's O_NONBLOCK mode. Mirrors accept4.
 	 */
 	{
 		int ready = hostsock_check_ready(sd->host_fd, 1);
@@ -871,28 +869,20 @@ static int hostsock_socketpair(struct posix_socket_driver *d __attribute__((unus
  *
  * The host poll result is authoritative and level-triggered, so a bit that
  * came back clear must be *cleared*, not merely left alone. Only ever setting
- * bits latches a socket readable forever: the first time data arrives POLLIN
- * goes up and never comes down, so poll()/epoll_wait() keep reporting the fd
- * ready, the caller reads, hostsock_recvfrom re-checks with the host, gets
- * "not ready" and returns EAGAIN — and round it goes. That is a livelock, and
- * an idle connection parked in a keep-alive pool is the common way to hit it.
+ * bits latches a socket readable forever: POLLIN goes up on the first data and
+ * never comes down, so poll()/epoll_wait() keep reporting the fd ready, the
+ * caller reads, hostsock_recvfrom re-checks with the host, gets "not ready"
+ * and returns EAGAIN -- a livelock, most easily hit by an idle connection
+ * parked in a keep-alive pool.
  *
- * Returns the events that are now set, so callers can tell whether this
- * socket has anything to wake on.
+ * Returns the events now set, so callers can tell whether this socket has
+ * anything to wake on.
  */
 static unsigned hostsock_publish_events(posix_sock *sock, int revents)
 {
-	unsigned set = 0, clr = 0;
-
-	if (revents & 1)
-		set |= UKFD_POLLIN;
-	else
-		clr |= UKFD_POLLIN;
-
-	if (revents & 4)
-		set |= UKFD_POLLOUT;
-	else
-		clr |= UKFD_POLLOUT;
+	unsigned set = ((revents & 1) ? UKFD_POLLIN : 0)
+		     | ((revents & 4) ? UKFD_POLLOUT : 0);
+	unsigned clr = (UKFD_POLLIN | UKFD_POLLOUT) & ~set;
 
 	/* Clear first: a set is what wakes waiters, so raising the new edge
 	 * last avoids a spurious wake on a bit we are about to drop.

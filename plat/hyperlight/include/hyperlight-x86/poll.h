@@ -7,18 +7,16 @@
 /*
  * Cooperative "poll" execution model for Hyperlight guests.
  *
- * Instead of running a guest function to full completion in a single VM
- * entry (see plat/hyperlight/dispatch.c), the poll model runs the
- * unikernel scheduler until it would go idle, then returns from the guest
- * function after reporting a next-wakeup deadline. The host then re-invokes
+ * Rather than run a guest function to completion in one VM entry (see
+ * dispatch.c), the poll model runs the scheduler until it would go idle,
+ * then returns to the host with a next-wakeup deadline. The host re-invokes
  * the `poll` guest function to make further progress.
  *
- * This is safe with the register-reset re-entry that Hyperlight performs
- * on every guest-function call, because we only ever hand control back at
- * the scheduler-idle point: at that instant every runnable thread's CPU
- * context has already been saved into its TCB in guest memory, which is
- * preserved across the HALT. The transient scheduler/idle stack that the
- * host resets carries no state that must survive.
+ * This survives the register reset Hyperlight performs on every entry
+ * because control is only ever handed back at the scheduler-idle point, at
+ * which every runnable thread's context is already saved in its TCB in guest
+ * memory. Only the transient scheduler/idle stack is lost, and it holds
+ * nothing that must survive.
  */
 
 #ifndef __HYPERLIGHT_X86_POLL_H__
@@ -26,24 +24,21 @@
 
 #include <uk/arch/types.h>
 
-struct uk_thread;
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+struct uk_thread;
+
 /**
  * Drive the scheduler until it would go idle, then return.
  *
- * Registered as the Hyperlight dispatch pump callback (see app-elfloader
- * main.c). Called from hyperlight_dispatch_inner() on every guest-function
- * invocation: the pump itself decides whether the call is the `poll` entry
- * point (carrying a batch of completed host calls) or an application-level
- * named call to route to the dispatch worker. Switches into the scheduler
- * so that runnable threads execute cooperatively. When the run queue drains,
- * the idle thread's normal timed or untimed platform halt operation switches
- * back here. Before returning, the pump reports the next-wakeup deadline
- * via a host function call.
+ * Registered as the dispatch pump callback (see app-elfloader main.c) and so
+ * reached on *every* guest function: the pump itself tells the `poll` entry
+ * point (which carries a batch of completed host calls) from an
+ * application-level named call, which it routes to the dispatch worker. The
+ * idle thread's platform halt hands control back here, and the pump then
+ * reports the next-wakeup deadline via a host call.
  */
 void hyperlight_poll_pump(void);
 
@@ -51,43 +46,40 @@ void hyperlight_poll_pump(void);
  * Handle a platform halt while a poll pump is active.
  *
  * The pump's idle thread returns to the host with @wakeup_time as its next
- * deadline. For a nonzero deadline, an application thread is instead parked
- * in the guest scheduler until that time. Outside a poll pump the halt is not
- * handled and the caller must halt the vCPU itself.
+ * deadline; any other thread with a nonzero deadline is instead parked in the
+ * guest scheduler until then. Outside a pump the halt is not handled and the
+ * caller must halt the vCPU itself.
  *
- * @param wakeup_time    Absolute monotonic-clock deadline of the next
- *                       sleeping thread, or 0 if none.
- * @return Non-zero if the halt was handled, otherwise zero.
+ * @param wakeup_time Absolute monotonic-clock deadline, or 0 if none.
+ * @return Non-zero if the halt was handled.
  */
 int hyperlight_poll_halt(__nsec wakeup_time);
 
 /**
  * Park the calling thread until explicitly woken.
  *
- * @return Non-zero if the caller was parked and resumed, otherwise zero.
+ * @return Non-zero if the caller was parked and resumed.
  */
 int hyperlight_poll_park(void);
 
 /**
- * Entry point of the dispatch worker thread.
+ * Entry point of the dispatch worker thread. Never returns.
  *
- * Named guest functions cannot run on the pump's own thread: that thread is
- * what returns control to the host, so a call that blocked there could never
- * yield the vCPU. app-elfloader creates one schedulable thread running this
- * loop; the pump hands it each named FunctionCall and it invokes the
- * application's FC-aware dispatch callback. Never returns.
+ * Named guest functions cannot run on the pump's own thread, which is what
+ * returns control to the host: a call blocking there could never yield the
+ * vCPU. app-elfloader runs this loop on a schedulable thread instead, and the
+ * pump hands it each named FunctionCall to invoke the application's callback.
  */
 void hyperlight_poll_dispatch_worker(void);
 
 /**
  * Nominate the thread running hyperlight_poll_dispatch_worker().
  *
- * Must be called when the worker is created rather than letting the worker
- * nominate itself on entry: the host may snapshot the guest before the
- * scheduler has ever run the worker, and a named call arriving on restore
- * would then be dropped. Until a worker is registered, named calls are left
- * for the application's own startup path (the first call enters through
- * main()).
+ * Must happen when the worker is created, not when it first runs: the host
+ * may snapshot before the scheduler has ever run the worker, and a named call
+ * arriving on restore would then be dropped. Until a worker is registered,
+ * named calls are left to the application's own startup path (the first call
+ * enters through main()).
  */
 void hyperlight_poll_set_dispatch_worker(struct uk_thread *t);
 

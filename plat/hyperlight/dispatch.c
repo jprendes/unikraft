@@ -58,10 +58,10 @@ typedef void (*hl_dispatch_fn)(const __u8 *fc_bytes, __sz fc_len);
  * registers it during boot and it receives every guest function, driving the
  * unikernel scheduler so that a call which blocks can still yield the vCPU.
  *
- * Named calls are routed on from there to g_dispatch_callback: the loaded
- * ELF exports a `__hl_guest_dispatch(fc_bytes, fc_len)` symbol and does its
- * own name-based routing using the hl_fb_* helpers in fb.h. It is installed
- * by the ELF writing through hyperlight_dispatch_v2_slot(), and invoked via
+ * Named calls are routed on to g_dispatch_callback: the loaded ELF exports a
+ * `__hl_guest_dispatch(fc_bytes, fc_len)` symbol and does its own name-based
+ * routing with the hl_fb_* helpers in fb.h. It installs itself by writing
+ * through hyperlight_dispatch_v2_slot(), and is invoked via
  * hyperlight_dispatch_invoke_v2().
  */
 static volatile hl_run_fn g_pump_callback;
@@ -355,14 +355,12 @@ hyperlight_dispatch_inner(void)
 		g_current_fc_len = 0;
 	}
 
-	/* Hand control to the cooperative poll pump.
-	 *
-	 * The pump is the only dispatch entry point: app-elfloader registers it
-	 * during boot, before the host can issue a guest function, and every
-	 * call -- including named ones bound for the application's FC-aware
-	 * callback -- reaches the application through it. See
-	 * hyperlight_dispatch_invoke_v2(), which owns the FS_BASE handover to
-	 * that callback.
+	/* Hand control to the cooperative poll pump, the only dispatch entry
+	 * point: app-elfloader registers it during boot, before the host can
+	 * issue a guest function, so every call -- including named ones bound
+	 * for the application's FC-aware callback -- reaches the application
+	 * through it. hyperlight_dispatch_invoke_v2() owns the FS_BASE handover
+	 * to that callback.
 	 */
 	if (g_pump_callback)
 		g_pump_callback();

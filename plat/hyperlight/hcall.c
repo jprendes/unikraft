@@ -376,17 +376,17 @@ static int hcall_pop(__u8 *stack, __u64 stack_size,
  * Public API: hyperlight_hcall()
  * ========================================================================
  *
- * One shared FlatBuffer encode buffer (static; request payloads are
- * bounded by HCALL_MAX_PAYLOAD plus an async-frame header). A single
- * thread running one dispatch at a time is the expected use.
+ * One shared encode buffer, sized for the largest request (an async-frame
+ * header plus HCALL_MAX_PAYLOAD). A single thread running one dispatch at a
+ * time is the expected use.
  */
 static __u8 hcall_encode_buf[FB_HEADER_SIZE + HCALL_FRAME_HEADER_LEN
 			     + HCALL_MAX_PAYLOAD + 4];
 
 /* Issue one host call and hand back the decoded result.
  *
- * @out_data points into the PEB input stack, not into storage owned here, so
- * it stays valid only until the next host call or dispatch. The sole caller
+ * @out_data points into the PEB input stack rather than storage owned here, so
+ * it is valid only until the next host call or dispatch. The sole caller
  * consumes it immediately.
  */
 static int hyperlight_hcall_once(const __u8 *hdr, __sz hdr_len,
@@ -444,16 +444,14 @@ static int hyperlight_hcall_once(const __u8 *hdr, __sz hdr_len,
 	return 0;
 }
 
-/* ------------------------------------------------------------------ *
- * Pending-op registry.
+/* Pending-op registry.
  *
- * Parked host calls register their struct hyperlight_hcall_op here
- * keyed by the op's guest-allocated request_id (nonzero u64). On each
- * host `poll`, hyperlight_poll_pump() calls hyperlight_hcall_deliver_batch()
- * with a binary batch of completed/errored tasks; each matching op
- * is resolved in place, unregistered, and its waiting thread is woken. All
- * mutations run synchronously on the single cooperative vCPU without yielding.
- * ------------------------------------------------------------------ */
+ * Parked host calls register here keyed by their guest-allocated request_id
+ * (nonzero u64). On each host `poll`, hyperlight_hcall_deliver_batch() gets a
+ * binary batch of completed tasks; each matching op is resolved in place,
+ * unregistered, and its waiter woken. All mutations run synchronously on the
+ * single cooperative vCPU without yielding.
+ */
 struct hyperlight_hcall_op {
 	__u64 request_id;
 	const __u8 *completion;
@@ -464,41 +462,34 @@ struct hyperlight_hcall_op {
 
 static struct hyperlight_hcall_op *hl_pending_ops;
 
-/* Monotonically increasing, nonzero request-ID counter, stored in static
- * guest memory, so it is preserved across snapshots and keeps counting over
- * the whole actor lineage rather than restarting per restored process.
+/* In static guest memory, so the counter is preserved across snapshots and
+ * keeps counting over the whole actor lineage instead of restarting per
+ * restored process.
  */
 static __u64 hl_next_request_id = 1;
 
-/* Stable snapshot of the most recent poll batch. deliver_batch() copies the
- * host's poll argument here (NOT into each caller's response buffer) so the
- * result survives until the parked caller is scheduled and reads it. This
- * matters because a caller's response buffer is typically a shared static
- * (e.g. hostsock's rpc_resp): between the poll pump copying a result and the
- * woken caller reading it, other cooperatively-scheduled threads may run and
- * clobber that shared buffer. hl_batch_buf is written only by the pump (IRQs
- * off, no concurrent writer) and read by each woken caller before it returns,
- * so it is stable across the wake window. It is only overwritten on the next
- * pump, by which point every caller woken by the previous pump has already run
- * (the pump returns to the host only once the scheduler is idle) and copied out
- * its value.
+/* Stable snapshot of the most recent poll batch, so a result survives until
+ * its parked caller is scheduled and reads it.
+ *
+ * Copying straight into each caller's response buffer would not: those are
+ * typically shared statics (e.g. hostsock's rpc_resp), and between the pump
+ * storing a result and the woken caller reading it, other cooperative threads
+ * run and clobber them. This buffer has a single writer (the pump, IRQs off)
+ * and is only overwritten on the next pump -- by which point every caller the
+ * previous pump woke has run and copied its value out, since the pump returns
+ * to the host only once the scheduler is idle.
  */
 static __u8 hl_batch_buf[HCALL_MAX_PAYLOAD];
 
 /* Allocate the next request ID.
  *
- * IDs must be unique among the currently registered ops (hcall_complete()
- * resolves the first list entry matching an ID) and nonzero (the host rejects
- * a zero ID as a protocol error). A bare increment satisfies both without a
- * collision scan, because the counter cannot wrap in practice: one ID is
- * allocated per hyperlight_hcall(), and every host call costs an outb VM exit
- * (~1us). Exhausting 2^64 IDs would therefore take on the order of 10^5 years
- * of uninterrupted host calls -- far beyond the lineage of any guest, even
- * though the counter persists across snapshots.
- *
- * The assert makes that reasoning fail loudly rather than silently: past a
- * wrap, a reissued ID could match a still-parked op and wake the wrong caller
- * with another's payload, and an ID of 0 would be rejected by the host.
+ * IDs must be nonzero (the host rejects 0) and unique among registered ops
+ * (hcall_complete() resolves the first match). A bare increment satisfies both
+ * without a collision scan because the counter cannot wrap in practice: one ID
+ * per hyperlight_hcall(), each costing an outb VM exit (~1us), puts 2^64 IDs at
+ * ~10^5 years of uninterrupted calls -- beyond any lineage, even though the
+ * counter persists across snapshots. The assert makes that reasoning fail
+ * loudly: past a wrap a reissued ID could wake the wrong caller.
  */
 static __u64 hcall_alloc_id(void)
 {
@@ -506,8 +497,8 @@ static __u64 hcall_alloc_id(void)
 	return hl_next_request_id++;
 }
 
-/* Write the 20-byte async-frame header. The body is never joined to it here:
- * hcall_encode() concatenates the two directly into the FlatBuffer it pushes,
+/* Write the 20-byte async-frame header. The body is not joined to it here:
+ * hcall_encode() concatenates the two straight into the FlatBuffer it pushes,
  * so a request is assembled exactly once.
  */
 static void hcall_frame_write_hdr(__u8 *hdr, __u8 kind, __u64 id,

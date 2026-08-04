@@ -35,34 +35,29 @@
 extern int hostsock_rescan_events(void);
 #endif
 
-/* The thread that the host `poll` invocation runs on. Captured on entry to
- * hyperlight_poll_pump() so the platform halt path can switch back to it.
- * NULL while no poll is in flight.
+/* Pump state, meaningful only while a pump is in flight.
+ *
+ * The host thread is the one the `poll` invocation runs on, captured so the
+ * platform halt path can switch back to it. Tracking the idle thread keeps
+ * that path from mistaking an application thread's wait for the run queue
+ * draining. The idle path records its next-wakeup deadline there for the pump
+ * to report before it returns to the host.
  */
 static struct uk_thread *hl_poll_host_thread;
-
-/* The scheduler idle thread driven by the current pump. Platform halt paths
- * use its identity to avoid intercepting waits made by application threads.
- */
 static struct uk_thread *hl_poll_idle_thread;
-
-/* Next-wakeup deadline recorded by the idle path and consumed by the pump
- * before it returns to the host.
- */
 static __nsec hl_poll_wakeup_time;
 
-/* The thread that runs application-registered named calls, and the call it
- * has been handed. See hyperlight_poll_dispatch_worker().
+/* The thread that runs application-registered named calls, the call it has
+ * been handed, and the flag it sets once one completes (consumed by the pump).
+ * See hyperlight_poll_dispatch_worker().
  */
 static struct uk_thread *hl_poll_worker_thread;
 static __u8 *hl_poll_call_fc;
 static __sz hl_poll_call_fc_len;
-
-/* Set once the worker finishes a named call, consumed by the pump. */
 static int hl_poll_call_done;
 
-/* Name of the guest function that drives the scheduler. Anything else is an
- * application-level call to be routed to the FC-aware dispatch callback.
+/* The guest function that drives the scheduler. Any other name is an
+ * application-level call for the FC-aware dispatch callback.
  */
 static const char hl_poll_fn_name[] = "poll";
 
@@ -100,9 +95,9 @@ static int hl_poll_fc_is_pump(const __u8 *b, __sz len, __sz fc)
 /* Hand a named FunctionCall to the dispatch worker and make it runnable.
  *
  * The bytes are copied because they live on the PEB input stack, which the
- * host reuses for host-call responses: the very first host call the
- * application makes would otherwise overwrite the arguments it is still
- * reading. The copy is released once the worker has consumed it.
+ * host reuses for host-call responses: the application's very first host call
+ * would otherwise overwrite the arguments it is still reading. The copy is
+ * released once the worker has consumed it.
  */
 static void hl_poll_route_call(const __u8 *b, __sz len)
 {
@@ -111,18 +106,17 @@ static void hl_poll_route_call(const __u8 *b, __sz len)
 	if (!hl_poll_worker_thread || !b || !len)
 		return;
 
-	/* Before the application registers a handler its own startup path owns
-	 * the call: the first guest function is what runs main(), and that path
-	 * reads the in-flight bytes straight out of the FC slots. Handing them
-	 * to the worker instead would swallow the call -- the worker has no
-	 * callback to invoke yet, so nobody would serve it.
+	/* Before the application registers a handler, its own startup path owns
+	 * the call: the first guest function is what runs main(), and it reads
+	 * the in-flight bytes straight out of the FC slots. Handing them to the
+	 * worker instead would swallow the call, as it has no callback yet.
 	 */
 	if (!*hyperlight_dispatch_v2_slot())
 		return;
 
-	/* One call is in flight at a time: the host cannot issue another
-	 * guest function until this pump returns, and the worker only parks
-	 * again after reporting completion.
+	/* One call is in flight at a time: the host cannot issue another guest
+	 * function until this pump returns, and the worker only parks again
+	 * after reporting completion.
 	 */
 	if (hl_poll_call_fc)
 		return;
@@ -140,15 +134,7 @@ static void hl_poll_route_call(const __u8 *b, __sz len)
 	uk_thread_wake(hl_poll_worker_thread);
 }
 
-/* Nominated when the worker thread is created, not when it first runs: the
- * host may snapshot the guest after the application has registered its
- * dispatch callback but before the scheduler has ever run the worker. A
- * named call arriving on restore would then find no worker, and
- * hl_poll_route_call() would drop it -- the v2-slot guard below already
- * passes at that point, so nothing else would serve it and the host would
- * wait forever. Registering eagerly keeps the pointer valid in every
- * snapshot.
- */
+/* Must be called at worker-creation time; see the header for why. */
 void hyperlight_poll_set_dispatch_worker(struct uk_thread *t)
 {
 	hl_poll_worker_thread = t;
@@ -168,15 +154,12 @@ void hyperlight_poll_dispatch_worker(void)
 		fc = hl_poll_call_fc;
 		fc_len = hl_poll_call_fc_len;
 
-		/* Only a call that actually ran counts as complete. */
-		if (hyperlight_dispatch_invoke_v2(fc, fc_len)) {
-			/* Tell the host the call it asked for has finished.
-			 * Reported by the pump on its next return, which is at
-			 * the latest when this thread parks below and the
-			 * scheduler goes idle.
-			 */
+		/* Only a call that actually ran counts as complete. The pump
+		 * reports it on its next return, at the latest when this
+		 * thread parks below and the scheduler goes idle.
+		 */
+		if (hyperlight_dispatch_invoke_v2(fc, fc_len))
 			hl_poll_call_done = 1;
-		}
 
 		hl_poll_call_fc = NULL;
 		hl_poll_call_fc_len = 0;
@@ -184,12 +167,9 @@ void hyperlight_poll_dispatch_worker(void)
 	}
 }
 
-/* Extract the first hlvecbytes parameter from the `poll` FunctionCall rooted
- * at @fc and deliver it as the completed-task batch.
- *
- * The host invokes `poll` with one binary frame containing every async result
- * ready for delivery. hyperlight_hcall_deliver_batch() validates and routes
- * its entries. The FC bytes are the ones dispatch.c stashed for this call.
+/* Deliver the `poll` FunctionCall's first hlvecbytes parameter as the
+ * completed-task batch: the host passes one binary frame holding every async
+ * result ready for delivery, which deliver_batch() validates and routes.
  */
 static void hyperlight_poll_deliver_arg(const __u8 *b, __sz len, __sz fc)
 {
@@ -225,9 +205,8 @@ static void hyperlight_poll_deliver_arg(const __u8 *b, __sz len, __sz fc)
 	hyperlight_hcall_deliver_batch(b + v + 4, (__sz)slen);
 }
 
-/* Dispose of the guest function call that triggered this pump run.
- *
- * `poll` carries the batch of completed host calls; any other name is an
+/* Dispose of the guest function call that triggered this pump run: `poll`
+ * carries the batch of completed host calls, any other name is an
  * application-level call for the dispatch worker to run on the scheduler.
  */
 static void hl_poll_handle_fc(const __u8 *b, __sz len)
@@ -240,11 +219,9 @@ static void hl_poll_handle_fc(const __u8 *b, __sz len)
 		hl_poll_route_call(b, len);
 }
 
-/* The calling thread, if it can be parked in the guest scheduler.
- *
- * Parking is only safe while a pump is driving the scheduler, and never for
- * the pump's own host thread: that is the thread which returns control to the
- * host, so blocking it would deadlock the pump.
+/* The calling thread, if it can be parked in the guest scheduler: only while a
+ * pump is driving it, and never the pump's own host thread, which returns
+ * control to the host and would deadlock the pump if blocked.
  */
 static struct uk_thread *hyperlight_poll_parkable_current(void)
 {
@@ -291,19 +268,15 @@ int hyperlight_poll_park(void)
 	return 1;
 }
 
-/* Report the next-wakeup deadline to the host via a synchronous host
- * function call, mirroring the {"name":...,"args":{...}} convention used
- * by the rest of the Hyperlight tooling (see plat/hyperlight/hcall.c and
- * the host-side ToolRegistry).
+/* Report the next-wakeup deadline to the host, using the same
+ * {"name":...,"args":{...}} convention as the rest of the Hyperlight tooling.
  *
- *   ns: nanoseconds until the next timer fires (0 = no pending timer;
- *       1 = re-poll immediately when a real timer is already due).
- *   call_done: a named guest function invoked through the dispatch worker
- *       has returned, so the host call that requested it is complete.
+ *   ns: nanoseconds until the next timer fires (0 = none pending; 1 = re-poll
+ *       immediately, a real timer is already due).
+ *   call_done: a named guest function run by the dispatch worker has returned.
  *
- * Process exit is signalled separately by the application through the
- * existing __hl_exit host function, so it is not reported here. Failures
- * are non-fatal: the host falls back to an immediate re-poll.
+ * Process exit is signalled separately by the application via __hl_exit.
+ * Failures are non-fatal: the host falls back to an immediate re-poll.
  */
 static void hyperlight_poll_report(__u64 ns, int call_done)
 {
@@ -333,33 +306,28 @@ void hyperlight_poll_pump(void)
 	unsigned long flags;
 	int call_done;
 
-	/* Fetch the scheduler idle thread via the generic sched op accessor
-	 * (dispatches through the registered idle_thread callback). The const
-	 * is dropped because uk_sched_thread_switch() needs a mutable handle;
-	 * the idle thread object is legitimately mutable.
+	/* The const is dropped because uk_sched_thread_switch() needs a mutable
+	 * handle; the idle thread object is legitimately mutable.
 	 */
 	idle = s ? (struct uk_thread *)uk_sched_idle_thread(s, 0) : __NULL;
 	if (unlikely(!idle)) {
 		/* No scheduler to drive: report "no timer" so the host does
-		 * not busy-loop, and let the application signal completion
-		 * via __hl_exit.
+		 * not busy-loop, and let __hl_exit signal completion.
 		 */
 		hyperlight_poll_report(0, 0);
 		return;
 	}
 
-	/* Remember both ends of the context switch and arm the platform halt
-	 * interception. Tracking the idle thread ensures application-thread
-	 * waits are never mistaken for the scheduler becoming idle.
+	/* Remember both ends of the context switch, arming the platform halt
+	 * interception.
 	 */
 	hl_poll_host_thread = uk_thread_current();
 	hl_poll_idle_thread = idle;
 
 	/* The cooperative scheduler requires IRQs enabled: schedcoop_schedule()
-	 * asserts this, and the idle thread we switch into will call it. The
-	 * guest `poll` dispatch enters with IRQs disabled, so enable them for
-	 * the duration of the scheduler run and restore the caller's state once
-	 * the idle path hands control back to us.
+	 * asserts this, and the idle thread we switch into calls it. The guest
+	 * dispatch enters with IRQs disabled, so enable them for the scheduler
+	 * run and restore the caller's state once idle hands control back.
 	 */
 	flags = uk_lcpu_save_irqf();
 	uk_lcpu_enable_irq();
@@ -369,29 +337,25 @@ void hyperlight_poll_pump(void)
 			  hyperlight_dispatch_current_fc_len());
 
 #ifdef CONFIG_LIBHOSTSOCK
-	/* A host `poll` re-entry is our chance to observe socket I/O that
-	 * arrived while the vCPU was yielded to the host. Refresh readiness
-	 * for all tracked host sockets so any thread parked on one (a
-	 * cooperative recv/accept wait) is woken and re-run below.
+	/* A re-entry is our chance to observe socket I/O that arrived while the
+	 * vCPU was yielded, so refresh readiness for all tracked host sockets:
+	 * any thread parked on one is then woken and re-run below.
 	 */
 	hostsock_rescan_events();
 #endif
 
-	/* Switch directly into the scheduler idle thread. It drives every
-	 * runnable thread cooperatively (idle yields to the run queue); when
-	 * the run queue drains it reaches its normal platform halt operation,
-	 * which switches control back to us.
+	/* Switch directly into the idle thread, which drives every runnable
+	 * thread cooperatively and, once the run queue drains, reaches its
+	 * platform halt operation and switches control back to us.
 	 *
-	 * Entering via the idle thread (rather than yielding from the host
-	 * thread) guarantees the scheduler reaches idle even though the host
-	 * thread remains "current" — the host thread is never offered to the
-	 * run queue, so it cannot be re-selected ahead of idle.
+	 * Entering via idle rather than yielding from the host thread
+	 * guarantees the scheduler reaches idle even though the host thread
+	 * stays "current": it is never offered to the run queue, so it cannot
+	 * be re-selected ahead of idle.
 	 */
 	uk_sched_thread_switch(idle);
 
-	/* Back from the idle path (IRQs disabled inside idle's critical
-	 * section); restore the IRQ state the dispatch entered with.
-	 */
+	/* Back from idle with IRQs disabled inside its critical section. */
 	uk_lcpu_restore_irqf(flags);
 
 	/* Snapshot and clear the shared state. */
@@ -402,11 +366,10 @@ void hyperlight_poll_pump(void)
 	hl_poll_wakeup_time = 0;
 	hl_poll_call_done = 0;
 
-	/* Translate the absolute deadline into a relative delay for the host.
-	 * Reserve 0 exclusively for "no pending timer." A real deadline can
-	 * become due while control switches from the idle thread back to this
-	 * pump; report the minimum nonzero delay in that case so the host
-	 * re-polls immediately instead of waiting indefinitely for external I/O.
+	/* Translate the absolute deadline into a relative delay, reserving 0
+	 * for "no pending timer". A real deadline can fall due while control
+	 * switches from idle back here; report the minimum nonzero delay then,
+	 * so the host re-polls at once instead of waiting for external I/O.
 	 */
 	if (wakeup_time) {
 		now = ukplat_monotonic_clock();
