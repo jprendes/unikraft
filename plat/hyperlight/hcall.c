@@ -182,8 +182,7 @@ static __sz hcall_encode(__u8 *buf, __sz buf_sz,
 	buf[99] = (plen >> 24) & 0xFF;
 
 	/* Byte 100+: header, payload data, then padding */
-	if (hdr_len > 0)
-		memcpy(buf + FB_HEADER_SIZE, hdr, hdr_len);
+	memcpy(buf + FB_HEADER_SIZE, hdr, hdr_len);
 	if (payload_len > 0)
 		memcpy(buf + FB_HEADER_SIZE + hdr_len, payload, payload_len);
 	if (aligned_len > joined_len)
@@ -559,7 +558,6 @@ void hyperlight_hcall_deliver_batch(const __u8 *frame, __sz frame_len)
 	const __u8 *end;
 	__sz payload_len;
 	__u64 count;
-	__u64 entry_id;
 	__u8 kind;
 
 	if (!frame || frame_len > sizeof(hl_batch_buf) ||
@@ -577,12 +575,12 @@ void hyperlight_hcall_deliver_batch(const __u8 *frame, __sz frame_len)
 	for (__u64 i = 0; i < count; i++) {
 		__u32 len;
 
-		if ((__sz)(end - p) < HCALL_BATCH_ENTRY_LEN)
+		if ((__sz)(end - p) < HCALL_BATCH_ENTRY_LEN ||
+		    !read_u64_le(p))
 			return;
-		entry_id = read_u64_le(p);
 		len = hl_fb_u32(p, 8);
 		p += HCALL_BATCH_ENTRY_LEN;
-		if (!entry_id || (__sz)(end - p) < len)
+		if ((__sz)(end - p) < len)
 			return;
 		p += len;
 	}
@@ -614,7 +612,6 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 	const __u8 *payload;
 	__sz frame_len = 0;
 	__sz payload_len;
-	__sz got;
 	__u8 kind;
 	int rc;
 
@@ -632,37 +629,34 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 			     &payload, &payload_len) < 0 ||
 	    response_id != id)
 		return -8;
-	if (kind == HCALL_FRAME_RESULT) {
-		if (payload_len > resp_cap)
-			return -7;
-		memcpy(resp, payload, payload_len);
-		if (resp_len)
-			*resp_len = payload_len;
-		return 0;
-	}
-	if (kind != HCALL_FRAME_PENDING || payload_len != 0)
-		return -8;
+	if (kind != HCALL_FRAME_RESULT) {
+		if (kind != HCALL_FRAME_PENDING || payload_len != 0)
+			return -8;
 
-	op.request_id = id;
-	op.next = hl_pending_ops;
-	hl_pending_ops = &op;
+		op.request_id = id;
+		op.next = hl_pending_ops;
+		hl_pending_ops = &op;
 
-	while (!op.completion && hyperlight_poll_park())
-		;
+		while (!op.completion && hyperlight_poll_park())
+			;
 
-	if (!op.completion) {
-		/* No park means no yield since insertion, so this is still the
-		 * registry head.
-		 */
-		UK_ASSERT(hl_pending_ops == &op);
-		hl_pending_ops = op.next;
-		return -8;
+		if (!op.completion) {
+			/* No park means no yield since insertion, so this is
+			 * still the registry head.
+			 */
+			UK_ASSERT(hl_pending_ops == &op);
+			hl_pending_ops = op.next;
+			return -8;
+		}
+		payload = op.completion;
+		payload_len = op.completion_len;
 	}
 
-	got = MIN(op.completion_len, resp_cap);
-	memcpy(resp, op.completion, got);
+	if (payload_len > resp_cap)
+		return -7;
+	memcpy(resp, payload, payload_len);
 	if (resp_len)
-		*resp_len = got;
+		*resp_len = payload_len;
 	return 0;
 }
 
