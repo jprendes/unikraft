@@ -27,9 +27,6 @@
 #include <uk/posix-fd.h>
 
 #include <hyperlight-x86/hcall.h>
-#include <uk/plat/time.h>
-
-extern void time_block_until(__snsec until);
 
 /* Max single RPC payload (matches HCALL_MAX_PAYLOAD). */
 #define HOSTSOCK_RPC_MAX 65536
@@ -538,10 +535,13 @@ static int hostsock_check_ready(uint32_t host_fd, int events)
 	return (int)revents;
 }
 
+/* SOCK_NONBLOCK in @flags is applied to the new descriptor by the
+ * posix-socket layer, so the driver has nothing to do with it here.
+ */
 static void *hostsock_accept4(posix_sock *sock,
 			      struct sockaddr *restrict addr,
 			      socklen_t *restrict addr_len,
-			      int flags)
+			      int flags __attribute__((unused)))
 {
 	struct hostsock_data *listen_data = posix_sock_get_data(sock);
 

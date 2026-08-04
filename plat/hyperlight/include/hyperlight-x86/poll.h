@@ -36,10 +36,12 @@ extern "C" {
  * Drive the scheduler until it would go idle, then return.
  *
  * Registered as the Hyperlight dispatch pump callback (see app-elfloader
- * main.c). Called from hyperlight_dispatch_inner() on every `poll`
- * guest-function invocation. Switches into the scheduler so that
- * runnable threads execute cooperatively. When the run queue drains, the
- * idle thread's normal timed or untimed platform halt operation switches
+ * main.c). Called from hyperlight_dispatch_inner() on every guest-function
+ * invocation: the pump itself decides whether the call is the `poll` entry
+ * point (carrying a batch of completed host calls) or an application-level
+ * named call to route to the dispatch worker. Switches into the scheduler
+ * so that runnable threads execute cooperatively. When the run queue drains,
+ * the idle thread's normal timed or untimed platform halt operation switches
  * back here. Before returning, the pump reports the next-wakeup deadline
  * via a host function call.
  */
@@ -80,8 +82,12 @@ void hyperlight_poll_dispatch_worker(void);
 /**
  * Nominate the thread running hyperlight_poll_dispatch_worker().
  *
- * Until a worker is registered, named calls are left for the application's
- * own startup path (the first call enters through main()).
+ * Must be called when the worker is created rather than letting the worker
+ * nominate itself on entry: the host may snapshot the guest before the
+ * scheduler has ever run the worker, and a named call arriving on restore
+ * would then be dropped. Until a worker is registered, named calls are left
+ * for the application's own startup path (the first call enters through
+ * main()).
  */
 void hyperlight_poll_set_dispatch_worker(struct uk_thread *t);
 

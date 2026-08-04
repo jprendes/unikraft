@@ -140,6 +140,15 @@ static void hl_poll_route_call(const __u8 *b, __sz len)
 	uk_thread_wake(hl_poll_worker_thread);
 }
 
+/* Nominated when the worker thread is created, not when it first runs: the
+ * host may snapshot the guest after the application has registered its
+ * dispatch callback but before the scheduler has ever run the worker. A
+ * named call arriving on restore would then find no worker, and
+ * hl_poll_route_call() would drop it -- the v2-slot guard below already
+ * passes at that point, so nothing else would serve it and the host would
+ * wait forever. Registering eagerly keeps the pointer valid in every
+ * snapshot.
+ */
 void hyperlight_poll_set_dispatch_worker(struct uk_thread *t)
 {
 	hl_poll_worker_thread = t;
@@ -214,6 +223,21 @@ static void hyperlight_poll_deliver_arg(const __u8 *b, __sz len, __sz fc)
 		return;
 
 	hyperlight_hcall_deliver_batch(b + v + 4, (__sz)slen);
+}
+
+/* Dispose of the guest function call that triggered this pump run.
+ *
+ * `poll` carries the batch of completed host calls; any other name is an
+ * application-level call for the dispatch worker to run on the scheduler.
+ */
+static void hl_poll_handle_fc(const __u8 *b, __sz len)
+{
+	__sz fc = hl_poll_fc_root(b, len);
+
+	if (fc && hl_poll_fc_is_pump(b, len, fc))
+		hyperlight_poll_deliver_arg(b, len, fc);
+	else
+		hl_poll_route_call(b, len);
 }
 
 /* The calling thread, if it can be parked in the guest scheduler.
@@ -302,12 +326,9 @@ static void hyperlight_poll_report(__u64 ns, int call_done)
 void hyperlight_poll_pump(void)
 {
 	struct uk_sched *s = uk_sched_current();
-	const __u8 *fc = hyperlight_dispatch_current_fc_bytes();
-	__sz fc_len = hyperlight_dispatch_current_fc_len();
 	struct uk_thread *idle;
 	__nsec wakeup_time;
 	__nsec now;
-	__sz fc_root;
 	__u64 ns;
 	unsigned long flags;
 	int call_done;
@@ -343,15 +364,9 @@ void hyperlight_poll_pump(void)
 	flags = uk_lcpu_save_irqf();
 	uk_lcpu_enable_irq();
 
-	/* Every guest function reaches the pump. `poll` carries the batch of
-	 * completed host calls; any other name is an application-level call
-	 * that the dispatch worker runs on the scheduler.
-	 */
-	fc_root = hl_poll_fc_root(fc, fc_len);
-	if (fc_root && hl_poll_fc_is_pump(fc, fc_len, fc_root))
-		hyperlight_poll_deliver_arg(fc, fc_len, fc_root);
-	else
-		hl_poll_route_call(fc, fc_len);
+	/* Every guest function reaches the pump. */
+	hl_poll_handle_fc(hyperlight_dispatch_current_fc_bytes(),
+			  hyperlight_dispatch_current_fc_len());
 
 #ifdef CONFIG_LIBHOSTSOCK
 	/* A host `poll` re-entry is our chance to observe socket I/O that
