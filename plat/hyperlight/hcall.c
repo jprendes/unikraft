@@ -138,16 +138,24 @@ static const __u8 hcall_fb_template[92] = {
 /**
  * Encode a __dispatch host function call as a size-prefixed FlatBuffer.
  *
- * @param buf Output buffer (must be >= FB_HEADER_SIZE + ALIGN4(payload_len))
+ * The payload is given as two chunks -- an async-frame header and its body --
+ * which are concatenated straight into @buf, so the caller never has to stage
+ * the joined frame anywhere.
+ *
+ * @param buf Output buffer (must be >= FB_HEADER_SIZE + ALIGN4(total payload))
  * @param buf_sz Size of output buffer
+ * @param hdr Frame header bytes
+ * @param hdr_len Length of the header chunk
  * @param payload JSON payload bytes
  * @param payload_len Length of payload
  * @return Total encoded size, or 0 on error
  */
 static __sz hcall_encode(__u8 *buf, __sz buf_sz,
+			 const __u8 *hdr, __sz hdr_len,
 			 const __u8 *payload, __sz payload_len)
 {
-	__sz aligned_len = (payload_len + 3) & ~(__sz)3;
+	__sz joined_len = hdr_len + payload_len;
+	__sz aligned_len = (joined_len + 3) & ~(__sz)3;
 	__sz total_size = FB_HEADER_SIZE + aligned_len;
 
 	if (total_size > buf_sz)
@@ -166,19 +174,21 @@ static __sz hcall_encode(__u8 *buf, __sz buf_sz,
 	       sizeof(hcall_fb_template));
 
 	/* Byte 96-99: payload vector length */
-	__u32 plen = (__u32)payload_len;
+	__u32 plen = (__u32)joined_len;
 
 	buf[96] = plen & 0xFF;
 	buf[97] = (plen >> 8) & 0xFF;
 	buf[98] = (plen >> 16) & 0xFF;
 	buf[99] = (plen >> 24) & 0xFF;
 
-	/* Byte 100+: payload data + padding */
+	/* Byte 100+: header, payload data, then padding */
+	if (hdr_len > 0)
+		memcpy(buf + FB_HEADER_SIZE, hdr, hdr_len);
 	if (payload_len > 0)
-		memcpy(buf + FB_HEADER_SIZE, payload, payload_len);
-	if (aligned_len > payload_len)
-		memset(buf + FB_HEADER_SIZE + payload_len, 0,
-		       aligned_len - payload_len);
+		memcpy(buf + FB_HEADER_SIZE + hdr_len, payload, payload_len);
+	if (aligned_len > joined_len)
+		memset(buf + FB_HEADER_SIZE + joined_len, 0,
+		       aligned_len - joined_len);
 
 	return total_size;
 }
@@ -367,14 +377,21 @@ static int hcall_pop(__u8 *stack, __u64 stack_size,
  * ========================================================================
  *
  * One shared FlatBuffer encode buffer (static; request payloads are
- * bounded by HCALL_MAX_PAYLOAD). Callers provide their own request and
- * response buffers so the API is stateless across calls -- a single
+ * bounded by HCALL_MAX_PAYLOAD plus an async-frame header). A single
  * thread running one dispatch at a time is the expected use.
  */
-static __u8 hcall_encode_buf[HCALL_MAX_PAYLOAD + 256];
+static __u8 hcall_encode_buf[FB_HEADER_SIZE + HCALL_FRAME_HEADER_LEN
+			     + HCALL_MAX_PAYLOAD + 4];
 
-static int hyperlight_hcall_once(const __u8 *req, __sz req_len,
-				 __u8 *resp, __sz resp_cap, __sz *resp_len)
+/* Issue one host call and hand back the decoded result.
+ *
+ * @out_data points into the PEB input stack, not into storage owned here, so
+ * it stays valid only until the next host call or dispatch. The sole caller
+ * consumes it immediately.
+ */
+static int hyperlight_hcall_once(const __u8 *hdr, __sz hdr_len,
+				 const __u8 *req, __sz req_len,
+				 const __u8 **out_data, __sz *out_len)
 {
 	struct hyperlight_peb *peb = hyperlight_get_peb();
 	__u8 *output_stack;
@@ -384,8 +401,6 @@ static int hyperlight_hcall_once(const __u8 *req, __sz req_len,
 	__sz fb_len;
 	const __u8 *result_fb;
 	__sz result_fb_len;
-	const __u8 *payload_data;
-	__sz payload_len;
 	int rc;
 
 	if (!peb)
@@ -402,7 +417,7 @@ static int hyperlight_hcall_once(const __u8 *req, __sz req_len,
 
 	/* 1. Encode FlatBuffer */
 	fb_len = hcall_encode(hcall_encode_buf, sizeof(hcall_encode_buf),
-			      req, req_len);
+			      hdr, hdr_len, req, req_len);
 	if (fb_len == 0)
 		return -3;
 
@@ -421,18 +436,10 @@ static int hyperlight_hcall_once(const __u8 *req, __sz req_len,
 	if (rc < 0)
 		return -5;
 
-	/* 5. Decode FlatBuffer result */
-	rc = hcall_decode(result_fb, result_fb_len,
-			  &payload_data, &payload_len);
+	/* 5. Decode FlatBuffer result (borrowed from the input stack) */
+	rc = hcall_decode(result_fb, result_fb_len, out_data, out_len);
 	if (rc < 0)
 		return -6;
-
-	/* 6. Copy into caller's buffer */
-	if (payload_len > resp_cap)
-		return -7;
-	memcpy(resp, payload_data, payload_len);
-	if (resp_len)
-		*resp_len = payload_len;
 
 	return 0;
 }
@@ -462,12 +469,6 @@ static struct hyperlight_hcall_op *hl_pending_ops;
  * the whole actor lineage rather than restarting per restored process.
  */
 static __u64 hl_next_request_id = 1;
-
-/* Request and response framing buffers are consumed before any cooperative
- * yield, so the single-vCPU dispatch invariant permits shared storage.
- */
-static __u8 hl_frame_req[HCALL_MAX_PAYLOAD + HCALL_FRAME_HEADER_LEN];
-static __u8 hl_frame_resp[HCALL_MAX_PAYLOAD + HCALL_FRAME_HEADER_LEN];
 
 /* Stable snapshot of the most recent poll batch. deliver_batch() copies the
  * host's poll argument here (NOT into each caller's response buffer) so the
@@ -505,18 +506,20 @@ static __u64 hcall_alloc_id(void)
 	return hl_next_request_id++;
 }
 
-static void hcall_frame_write(__u8 *frame, __u8 kind, __u64 id,
-			      const __u8 *payload, __sz payload_len)
+/* Write the 20-byte async-frame header. The body is never joined to it here:
+ * hcall_encode() concatenates the two directly into the FlatBuffer it pushes,
+ * so a request is assembled exactly once.
+ */
+static void hcall_frame_write_hdr(__u8 *hdr, __u8 kind, __u64 id,
+				  __sz payload_len)
 {
-	memcpy(frame, "HLAF", 4);
-	frame[4] = 1;
-	frame[5] = kind;
-	frame[6] = 0;
-	frame[7] = 0;
-	write_u64_le(frame + 8, id);
-	write_u32_le(frame + 16, (__u32)payload_len);
-	if (payload_len)
-		memcpy(frame + HCALL_FRAME_HEADER_LEN, payload, payload_len);
+	memcpy(hdr, "HLAF", 4);
+	hdr[4] = 1;
+	hdr[5] = kind;
+	hdr[6] = 0;
+	hdr[7] = 0;
+	write_u64_le(hdr + 8, id);
+	write_u32_le(hdr + 16, (__u32)payload_len);
 }
 
 static int hcall_frame_read(const __u8 *frame, __sz frame_len,
@@ -613,26 +616,28 @@ int hyperlight_hcall(const __u8 *req, __sz req_len,
 	struct hyperlight_hcall_op op = {
 		.waiter = uk_thread_current(),
 	};
+	__u8 hdr[HCALL_FRAME_HEADER_LEN];
 	__u64 id;
 	__u64 response_id;
+	const __u8 *frame;
 	const __u8 *payload;
+	__sz frame_len = 0;
 	__sz payload_len;
-	__sz got = 0;
+	__sz got;
 	__u8 kind;
 	int rc;
 
 	if (req_len > HCALL_MAX_PAYLOAD)
 		return -3;
 	id = hcall_alloc_id();
-	hcall_frame_write(hl_frame_req, HCALL_FRAME_REQUEST, id, req, req_len);
+	hcall_frame_write_hdr(hdr, HCALL_FRAME_REQUEST, id, req_len);
 
-	rc = hyperlight_hcall_once(hl_frame_req,
-				  HCALL_FRAME_HEADER_LEN + req_len,
-				  hl_frame_resp, sizeof(hl_frame_resp), &got);
+	rc = hyperlight_hcall_once(hdr, sizeof(hdr), req, req_len,
+				   &frame, &frame_len);
 	if (rc < 0)
 		return rc;
 
-	if (hcall_frame_read(hl_frame_resp, got, &kind, &response_id,
+	if (hcall_frame_read(frame, frame_len, &kind, &response_id,
 			     &payload, &payload_len) < 0 ||
 	    response_id != id)
 		return -8;
