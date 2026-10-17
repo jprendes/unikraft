@@ -425,7 +425,11 @@ vfscore_ioctl(struct vfscore_file *fp, unsigned long request, void *buf)
 	}
 
 	error = vfs_ioctl(fp, request, buf);
-	if (unlikely(error))
+	/* Only these requests changed flags above. A driver may release the
+	 * file lock while waiting; other ioctls must not undo a concurrent
+	 * flag update when they return an error.
+	 */
+	if (unlikely(error) && (request == FIONBIO || request == FIOASYNC))
 		fp->f_flags = oldf;
 
 exit:

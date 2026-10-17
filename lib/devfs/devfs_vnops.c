@@ -49,6 +49,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <sys/mount.h>
+#include <sys/ioctl.h>
 
 #include <dirent.h>
 #include <vfscore/prex.h>
@@ -121,12 +122,23 @@ devfs_write(struct vnode *vp, struct uio *uio, int ioflags)
 }
 
 static int
-devfs_ioctl(struct vnode *vp, struct vfscore_file *fp __unused,
+devfs_ioctl(struct vnode *vp, struct vfscore_file *fp,
 			unsigned long cmd, void *arg)
 {
 	int error;
+	struct device *dev = (struct device *)vp->v_data;
+	int unlocked = (dev->flags & D_IOCTL_UNLOCKED) &&
+		cmd != FIONBIO && cmd != FIOASYNC;
 
-	error = device_ioctl((struct device *)vp->v_data, cmd, arg);
+	if (unlocked) {
+		vn_unlock(vp);
+		FD_UNLOCK(fp);
+	}
+	error = device_ioctl(dev, cmd, arg);
+	if (unlocked) {
+		FD_LOCK(fp);
+		vn_lock(vp);
+	}
 	uk_pr_debug("%s: cmd=%lu\n", __func__, cmd);
 	return error;
 }
