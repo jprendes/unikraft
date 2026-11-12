@@ -296,6 +296,14 @@ int hl_hcall_int(const char *func_name,
 		 const struct hl_param *params, int nparams,
 		 __s32 *out);
 
+/*
+ * A typed integer call using the async completion envelope: tag 0 + LE i32,
+ * or tag 2 + request ID. Parks only the calling thread for a pending reply.
+ * Requires CONFIG_LIBDEVFS; returns 0 or a negative errno.
+ */
+int hl_hcall_async_int(const char *name, const struct hl_param *params,
+		      int nparams, __s32 *result);
+
 /**
  * Call a host function returning u64.
  */

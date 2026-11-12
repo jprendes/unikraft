@@ -344,7 +344,9 @@ hyperlight_dispatch_inner(void)
 	 * fetches only when it changed.  `resume` skips it: the host gives
 	 * the first call after a restore a new version.
 	 */
-	if (!hl_pc_name_is(&call, "step") && !hl_pc_name_is(&call, "resume"))
+	if (!hl_pc_name_is(&call, "step") &&
+	    !hl_pc_name_is(&call, "step_async") &&
+	    !hl_pc_name_is(&call, "resume"))
 		hyperlight_dispatch_apply_host_env_version(
 			hl_pc_env_version(&call));
 

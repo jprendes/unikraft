@@ -166,6 +166,23 @@ static void hl_emit_yield(__u64 ns)
  * /dev/hlcall reader.
  */
 static const char hl_step_fn_name[] = "step";
+static const char hl_async_step_fn_name[] = "step_async";
+static int hl_async_supported;
+
+static void hl_async_negotiate(void)
+{
+#if CONFIG_LIBDEVFS
+	__u64 version = 0;
+
+	hl_async_supported =
+		hl_hcall_ulong("AsyncHostCallVersion", NULL, 0, &version) == 0 &&
+		version == 1;
+	/* Advertise that this kernel interrupts unfinished calls on resume. */
+	if (hl_async_supported)
+		(void)hl_hcall_ulong("AsyncHostCallInterruptVersion",
+				    NULL, 0, &version);
+#endif
+}
 static const char hl_resume_fn_name[] = "resume";
 
 /* ── Pump state ──────────────────────────────────────────────────── */
@@ -460,6 +477,205 @@ static int hlcall_write(struct device *dev __unused, struct uio *uio,
 	return 0;
 }
 
+struct hl_async_wait {
+	struct hl_async_wait *next;
+	struct uk_thread *thread;
+	__u64 id;
+	__u8 *out;
+	__u64 cap, len;
+	int done;
+	int error;
+};
+
+static struct hl_async_wait *hl_async_waiters;
+
+static void hl_async_remove(struct hl_async_wait *wait)
+{
+	struct hl_async_wait **link = &hl_async_waiters;
+
+	while (*link && *link != wait)
+		link = &(*link)->next;
+	if (*link)
+		*link = wait->next;
+	uk_free(uk_alloc_get_default(), wait);
+}
+
+static void hl_async_cancel(__u64 id)
+{
+	struct hl_param p = { .type = HL_PV_HLULONG, .u64_val = id };
+	__s32 out;
+
+	if (hl_hcall_int("CancelAsyncHostCall", &p, 1, &out) < 0)
+		uk_pr_err("hyperlight: failed to cancel async host call\n");
+}
+
+/* A killed thread must never receive a reply into its released stack. */
+static void hl_async_thread_term(struct uk_thread *thread)
+{
+	struct hl_async_wait *w = hl_async_waiters, *next;
+
+	while (w) {
+		next = w->next;
+		if (w->thread == thread) {
+			if (!w->done)
+				hl_async_cancel(w->id);
+			hl_async_remove(w);
+		}
+		w = next;
+	}
+}
+
+UK_THREAD_INIT_PRIO_FLAGS(0, hl_async_thread_term, 0, 0);
+
+static __u32 hl_async_u32(const __u8 *p)
+{
+	return (__u32)p[0] | ((__u32)p[1] << 8) |
+	       ((__u32)p[2] << 16) | ((__u32)p[3] << 24);
+}
+
+static __u64 hl_async_u64(const __u8 *p)
+{
+	return (__u64)hl_async_u32(p) | ((__u64)hl_async_u32(p + 4) << 32);
+}
+
+static int hl_async_wait_for(__u64 id, __u8 *out, __u64 cap, __u64 *len)
+{
+	struct hl_async_wait *wait;
+	int error;
+
+	if (!hl_async_supported || !id)
+		return EPROTO;
+	wait = uk_malloc(uk_alloc_get_default(), sizeof(*wait));
+	if (!wait) {
+		hl_async_cancel(id);
+		return ENOMEM;
+	}
+	*wait = (struct hl_async_wait) {
+		.next = hl_async_waiters,
+		.thread = uk_thread_current(),
+		.id = id,
+		.out = out,
+		.cap = cap,
+	};
+	hl_async_waiters = wait;
+	while (!wait->done) {
+		uk_thread_block(wait->thread);
+		uk_sched_yield();
+	}
+	*len = wait->len;
+	error = wait->error ? wait->error : (wait->len > cap ? ENOBUFS : 0);
+	hl_async_remove(wait);
+	return error;
+}
+
+int hl_hcall_async_int(const char *name, const struct hl_param *params,
+		      int nparams, __s32 *result)
+{
+	__u8 reply[9];
+	__sz len;
+	__u64 completed;
+	int error;
+
+	if (hl_hcall_vecbytes(name, params, nparams, reply, sizeof(reply),
+			      &len) < 0)
+		return -EIO;
+	if (len && reply[0] == 2) {
+		if (len != 9)
+			return -EPROTO;
+		error = hl_async_wait_for(hl_async_u64(reply + 1), reply,
+					 sizeof(reply), &completed);
+		if (error)
+			return -error;
+		len = completed;
+	}
+	if (len != 5 || reply[0] != 0)
+		return -EPROTO;
+	*result = (__s32)hl_async_u32(reply + 1);
+	return 0;
+}
+
+static void hl_async_finish(struct hl_async_wait *wait, const __u8 *reply,
+			    __u64 len)
+{
+	wait->len = len;
+	if (len <= wait->cap)
+		memcpy(wait->out, reply, len);
+	wait->done = 1;
+	uk_thread_wake(wait->thread);
+}
+
+/* Wake only after socket/mount/clock restoration and never cancel an old ID
+ * against the new host's request namespace.
+ */
+static void hl_async_restore(void)
+{
+	struct hl_async_wait *wait;
+
+	for (wait = hl_async_waiters; wait; wait = wait->next) {
+		/* Even a delivered waiter must leave the old ID namespace. */
+		wait->id = 0;
+		if (wait->done)
+			continue;
+		wait->error = EINTR;
+		wait->len = 0;
+		wait->done = 1;
+		uk_thread_wake(wait->thread);
+	}
+}
+
+/* Validate everything before publishing any completion. */
+static int hl_async_deliver(const __u8 *buf, __u64 len)
+{
+	struct hl_async_wait *waiters[64], *w;
+	const __u8 *replies[64];
+	__u32 lengths[64], count, i, j, n;
+	__u64 id, pos = 8;
+
+	if (len < 8 || len > hyperlight_dispatch_max_call() ||
+	    hl_async_u32(buf) != 1)
+		return -1;
+	count = hl_async_u32(buf + 4);
+	if (!count || count > 64)
+		return -1;
+	for (i = 0; i < count; i++) {
+		if (len - pos < 12)
+			return -1;
+		id = hl_async_u64(buf + pos);
+		n = hl_async_u32(buf + pos + 8);
+		pos += 12;
+		if (!n || n > hl_hcall_max_payload() || n > len - pos ||
+		    buf[pos] > 1)
+			return -1;
+		for (w = hl_async_waiters; w && w->id != id; w = w->next)
+			;
+		if (!w || w->done)
+			return -1;
+		for (j = 0; j < i; j++)
+			if (waiters[j] == w)
+				return -1;
+		waiters[i] = w;
+		replies[i] = buf + pos;
+		lengths[i] = n;
+		pos += n;
+	}
+	if (pos != len)
+		return -1;
+	for (i = 0; i < count; i++) {
+		w = waiters[i];
+		hl_async_finish(w, replies[i], lengths[i]);
+	}
+	return 0;
+}
+
+/* The decoded Postcard call carries one contiguous completion batch. */
+static int hl_async_step(const struct hl_pc_call *call)
+{
+	if (call->np != 1 || call->params[0].type != HL_PV_HLVECBYTES)
+		return -1;
+	return hl_async_deliver(call->params[0].vec.ptr,
+				call->params[0].vec.len);
+}
+
 /* HLCALL_IOC_HOSTCALL: HostCall(name, args) on the host, the reply into
  * the driver's buffer.  See step.h.
  */
@@ -494,8 +710,8 @@ static int hl_host_call(struct hlcall_hostcall *arg)
 	 * fails with EILSEQ (hl_hcall_vecbytes() would refuse it too, but
 	 * as EIO), and the reply arrives whole before the driver's buffer,
 	 * which may be too small for it (ENOBUFS, with its length), is
-	 * written.  The vnode lock around this ioctl keeps both buffers to
-	 * one host call at a time.
+	 * written. This single-vCPU path does not schedule until after the
+	 * reply is copied out of these shared buffers.
 	 */
 	memcpy(hl_args_buf, hc.name, hc.name_len);
 	if (!hl_utf8_valid(hl_args_buf, hc.name_len))
@@ -515,6 +731,12 @@ static int hl_host_call(struct hlcall_hostcall *arg)
 	if (hl_hcall_vecbytes("HostCall", p, 2, hl_reply_buf, hl_reply_cap,
 			      &len) < 0)
 		return EIO;
+	if (len && hl_reply_buf[0] == 2) {
+		if (len != 9)
+			return EPROTO;
+		return hl_async_wait_for(hl_async_u64(hl_reply_buf + 1),
+					 hc.out, hc.out_cap, &arg->out_len);
+	}
 	arg->out_len = len;
 	if (len > hc.out_cap)
 		return ENOBUFS;
@@ -580,7 +802,8 @@ static int hlcall_register(struct uk_init_ctx *ictx __unused)
 {
 	int rc;
 
-	rc = device_create(&hlcall_driver, "hlcall", D_CHR, NULL);
+	rc = device_create(&hlcall_driver, "hlcall",
+			   D_CHR | D_IOCTL_UNLOCKED, NULL);
 	if (unlikely(rc)) {
 		uk_pr_err("hyperlight: failed to register /dev/hlcall: %d\n",
 			  rc);
@@ -655,6 +878,8 @@ static int hl_yield_thread_create(struct uk_init_ctx *ictx __unused)
 			  "the step model is unavailable\n");
 		return 0;
 	}
+	/* A driverless entry can wait on networking before the first idle. */
+	hl_async_negotiate();
 	return 0;
 }
 
@@ -761,6 +986,7 @@ static void hl_resume(void)
 	int rc;
 #endif /* CONFIG_LIBUKRANDOM */
 
+	hl_async_negotiate();
 	hyperlight_console_resume();
 	hl_restores++;
 #if CONFIG_LIBUKRANDOM
@@ -782,6 +1008,9 @@ static void hl_resume(void)
 		hyperlight_time_resync();
 		hyperlight_resolv_apply();
 	}
+#if CONFIG_LIBDEVFS
+	hl_async_restore();
+#endif
 	/* The new host has not heard these yet. */
 	if (hl_call_opened)
 		hl_emit("DriverReady");
@@ -845,7 +1074,17 @@ void hyperlight_step_pump(const __u8 *fc, __u64 fc_len,
 		return;
 	}
 
-	if (hl_pc_name_is(call, hl_resume_fn_name))
+	if (hl_pc_name_is(call, hl_async_step_fn_name)) {
+#if CONFIG_LIBDEVFS
+		if (!hl_async_supported || hl_async_step(call) < 0) {
+			uk_pr_err("hyperlight: malformed async completion batch\n");
+			return;
+		}
+#else
+		uk_pr_err("hyperlight: async host calls require devfs\n");
+		return;
+#endif
+	} else if (hl_pc_name_is(call, hl_resume_fn_name))
 		hl_resume();
 	else if (!hl_pc_name_is(call, hl_step_fn_name))
 		hl_route_call(fc, fc_len, call);

@@ -138,7 +138,8 @@ struct hlcall_hostcall {
  * and the arguments together exceed what a host call carries; EILSEQ if
  * the name is not UTF-8 (the host takes it as a string); ENOMEM if the
  * kernel's buffers for host calls could not be allocated; EIO if the host
- * has no HostCall or could not deliver it; ENOBUFS, with @out_len the
+ * has no HostCall or could not deliver it; EINTR if an async call is
+ * interrupted on restore; ENOBUFS, with @out_len the
  * reply's size, if it does not fit @out_cap.  HLCALL_IOC_MAXLEN bytes
  * always hold it, as long as the host sizes H2G to hold any host call
  * reply (hluk does), as for HLCALL_IOC_GETENV.
