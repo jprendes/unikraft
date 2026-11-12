@@ -17,6 +17,7 @@
 #include <uk/errptr.h>
 #include <uk/print.h>
 #include <uk/list.h>
+#include <uk/sched.h>
 
 #include <uk/socket_driver.h>
 
@@ -35,8 +36,8 @@
  * when the first socket is created: the host decides how much one call
  * carries, the guest never guesses.  Heap, not stack -- a payload does not
  * fit a thread stack -- and shared: the single vCPU and the hcall spinlock
- * keep every use exclusive, and no socket operation yields between
- * filling a buffer and the host call that consumes it.
+ * keep every use exclusive. A deferred policy check may yield only after
+ * the host call has copied its input; no shared buffer survives that wait.
  */
 static __u8 *g_recv_buf;	/* a net_recvfrom result */
 static __u8 *g_send_buf;	/* gathered iovecs for net_send */
@@ -98,6 +99,21 @@ struct hostsock {
 /* Every live socket, in creation order, for hostsock_resume(). */
 static UK_LIST_HEAD(hostsock_all);
 
+#if CONFIG_LIBDEVFS
+static struct uk_thread *hostsock_waiter;
+static int hostsock_waiting;
+static void hostsock_wait_loop(void *arg);
+#endif
+
+static void hostsock_wake_waiter(void)
+{
+#if CONFIG_LIBDEVFS
+	if (hostsock_waiter && !hostsock_waiting &&
+	    uk_thread_current() != hostsock_waiter)
+		uk_thread_wake(hostsock_waiter);
+#endif
+}
+
 static inline struct hostsock *hs_of(posix_sock *sock)
 {
 	return (struct hostsock *)posix_sock_get_data(sock);
@@ -121,6 +137,21 @@ static struct hostsock *hs_new(int host_fd, int family, int type,
 	hs = uk_calloc(uk_alloc_get_default(), 1, sizeof(*hs));
 	if (unlikely(!hs))
 		return NULL;
+#if CONFIG_LIBDEVFS
+	if (!hostsock_waiter) {
+		/* No TLS: this kernel worker must not inherit a process fd table. */
+		struct uk_thread *thread = uk_sched_thread_create_fn1(
+			uk_sched_current(), hostsock_wait_loop, NULL,
+			0, 0, true, false, "hostsock_wait", NULL, NULL);
+
+		if (!thread || PTRISERR(thread)) {
+			uk_pr_err("hostsock: cannot create readiness waiter\n");
+			uk_free(uk_alloc_get_default(), hs);
+			return NULL;
+		}
+		hostsock_waiter = thread;
+	}
+#endif
 	hs->host_fd = host_fd;
 	hs->family = family;
 	hs->type = type;
@@ -368,6 +399,7 @@ static int hostsock_ready(posix_sock *sock, int events)
 	else
 		revents = hostsock_check_ready(sock_fd(sock), events);
 	hostsock_publish_events(sock, revents, events);
+	hostsock_wake_waiter();
 	return revents;
 }
 
@@ -431,6 +463,15 @@ static int hc_addr_op(const char *op, int host_fd,
 	p[2].type = HL_PV_HLSTRING; p[2].str.ptr = addrbuf;
 				     p[2].str.len = strlen(addrbuf);
 	p[3].type = HL_PV_HLINT;    p[3].i32_val = port;
+#if CONFIG_LIBDEVFS
+	if (!strcmp(op, "net_connect")) {
+		int rc = hl_hcall_async_int("net_connect_async", p, 4, &ret);
+
+		if (rc < 0)
+			return rc;
+		return ret < 0 ? ret : 0;
+	}
+#endif
 	if (hl_hcall_int(op, p, 4, &ret) < 0)
 		return -EIO;
 	return ret < 0 ? ret : 0;
@@ -716,8 +757,17 @@ hostsock_sendto(posix_sock *sock, const void *buf, size_t len,
 					       p[3].str.len = strlen(addrbuf);
 		p[4].type = HL_PV_HLINT;      p[4].i32_val = port;
 
+#if CONFIG_LIBDEVFS
+		{
+			int rc = hl_hcall_async_int("net_sendto_async", p, 5, &ret);
+
+			if (rc < 0)
+				return rc;
+		}
+#else
 		if (hl_hcall_int("net_sendto", p, 5, &ret) < 0)
 			return -EIO;
+#endif
 
 		return ret;
 	} else {
@@ -729,8 +779,17 @@ hostsock_sendto(posix_sock *sock, const void *buf, size_t len,
 		p[1].type = HL_PV_HLVECBYTES; p[1].vec.ptr = (const __u8 *)buf;
 					       p[1].vec.len = len;
 
+#if CONFIG_LIBDEVFS
+		{
+			int rc = hl_hcall_async_int("net_send_async", p, 2, &ret);
+
+			if (rc < 0)
+				return rc;
+		}
+#else
 		if (hl_hcall_int("net_send", p, 2, &ret) < 0)
 			return -EIO;
+#endif
 
 		return ret;
 	}
@@ -851,8 +910,17 @@ hostsock_write(posix_sock *sock, const struct iovec *iov, size_t iovcnt)
 	p[1].type = HL_PV_HLVECBYTES; p[1].vec.ptr = g_send_buf;
 				       p[1].vec.len = off;
 
+#if CONFIG_LIBDEVFS
+	{
+		int rc = hl_hcall_async_int("net_send_async", p, 2, &ret);
+
+		if (rc < 0)
+			return rc;
+	}
+#else
 	if (hl_hcall_int("net_send", p, 2, &ret) < 0)
 		return -EIO;
+#endif
 
 	return ret;
 }
@@ -1156,8 +1224,38 @@ int hostsock_rescan_events(void)
 			woke = 1;
 	}
 
+	hostsock_wake_waiter();
 	return woke;
 }
+
+#if CONFIG_LIBDEVFS
+/* A readiness wait is idempotent: EINTR simply rechecks the restored sockets.
+ * The socket operations remain nonblocking, including poll/select callers.
+ * The completion pump rescans sockets before scheduling this thread again.
+ */
+static void hostsock_wait_loop(void *arg __unused)
+{
+	for (;;) {
+		__s32 result;
+		int rc;
+
+		hostsock_waiting = 1;
+		rc = hl_hcall_async_int("net_wait_async", NULL, 0, &result);
+		hostsock_waiting = 0;
+		if (rc < 0)
+			result = rc;
+		if (result == -EINTR)
+			continue;
+		if (!result || result == -EOPNOTSUPP) {
+			uk_thread_block(uk_thread_current());
+			uk_sched_yield();
+			continue;
+		}
+		if (result < 0)
+			UK_CRASH("hostsock: readiness wait failed (%d)\n", result);
+	}
+}
+#endif
 
 /* ── Snapshot restore ────────────────────────────────────────────── */
 
