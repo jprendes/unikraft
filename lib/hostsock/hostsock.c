@@ -1288,6 +1288,16 @@ static void hostsock_wait_loop(void *arg)
 		waiter->waiting = 0;
 		if (rc < 0)
 			result = rc;
+		if (result == -ECANCELED) {
+			/* Tree teardown will close the sockets and wake us. Do not
+			 * submit another host readiness wait while it unwinds.
+			 */
+			if (waiter->sockets) {
+				uk_thread_block(uk_thread_current());
+				uk_sched_yield();
+			}
+			continue;
+		}
 		if (result == -EINTR)
 			continue;
 		if (!result || result == -EOPNOTSUPP) {
