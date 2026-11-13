@@ -177,8 +177,29 @@ struct hl_execution {
 	struct hl_execution *next;
 	__u64 id;
 	unsigned int threads;
+	int stopping;
 };
 static struct hl_execution *hl_executions;
+
+#if CONFIG_LIBDEVFS
+static struct hl_execution *hl_execution_find(__u64 id)
+{
+	struct hl_execution *execution;
+
+	for (execution = hl_executions; execution; execution = execution->next)
+		if (execution->id == id)
+			return execution;
+	return NULL;
+}
+
+static int hl_execution_stopping(void)
+{
+	struct hl_execution *execution =
+		hl_execution_find(uk_thread_current()->hyperlight_execution);
+
+	return execution && execution->stopping;
+}
+#endif
 
 static int hl_execution_get(__u64 id)
 {
@@ -574,6 +595,24 @@ static void hl_async_cancel(__u64 id)
 		uk_pr_err("hyperlight: failed to cancel async host call\n");
 }
 
+static void hl_async_cancel_execution(__u64 id)
+{
+	struct hl_async_wait *wait;
+	struct uk_thread *current = uk_thread_current();
+	__u64 previous = current->hyperlight_execution;
+
+	current->hyperlight_execution = id;
+	for (wait = hl_async_waiters; wait; wait = wait->next) {
+		if (wait->thread->hyperlight_execution != id || wait->done)
+			continue;
+		hl_async_cancel(wait->id);
+		wait->error = ECANCELED;
+		wait->done = 1;
+		uk_thread_wake(wait->thread);
+	}
+	current->hyperlight_execution = previous;
+}
+
 /* A killed thread must never receive a reply into its released stack. */
 static void hl_async_thread_term(struct uk_thread *thread)
 {
@@ -612,6 +651,10 @@ static int hl_async_wait_for(__u64 id, __u8 *out, __u64 cap, __u64 *len)
 	struct hl_async_wait *wait;
 	int error;
 
+	if (hl_execution_stopping()) {
+		hl_async_cancel(id);
+		return ECANCELED;
+	}
 	if (!hl_async_supported || !id)
 		return EPROTO;
 	wait = uk_malloc(uk_alloc_get_default(), sizeof(*wait));
@@ -650,6 +693,8 @@ int hl_hcall_async_int(const char *name, const struct hl_param *params,
 	__u64 completed;
 	int error;
 
+	if (hl_execution_stopping())
+		return -ECANCELED;
 	if (hl_hcall_vecbytes(name, params, nparams, reply, sizeof(reply),
 			      &len) < 0)
 		return -EIO;
@@ -834,6 +879,10 @@ static int hl_command_io(struct hl_command_io *io)
 	if (!uk_thread_current()->hyperlight_execution ||
 	    io->stream > 2 || io->len > 4096 || (io->len && !io->buf))
 		return EINVAL;
+	if (hl_execution_stopping()) {
+		io->done = 0;
+		return io->stream ? EPIPE : 0;
+	}
 	p[0].type = HL_PV_HLULONG;
 	p[0].u64_val = io->stream;
 	p[1].type = HL_PV_HLVECBYTES;
@@ -844,6 +893,10 @@ static int hl_command_io(struct hl_command_io *io)
 	if (len == 9 && reply[0] == 2) {
 		error = hl_async_wait_for(hl_async_u64(reply + 1), reply,
 					 sizeof(reply), &completed);
+		if (error == ECANCELED && hl_execution_stopping()) {
+			io->done = 0;
+			return io->stream ? EPIPE : 0;
+		}
 		if (error)
 			return error;
 		len = completed;
@@ -865,15 +918,23 @@ static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
 		return EINVAL;
 
 	switch (cmd) {
-	case HLCALL_IOC_EXECUTION_KILL:
+	case HLCALL_IOC_EXECUTION_KILL: {
+		struct hl_execution *execution;
+
 		if (!hyperlight_execution_enabled || !*(__u64 *)arg ||
 		    uk_thread_current()->hyperlight_execution)
 			return EINVAL;
 #if CONFIG_LIBPOSIX_PROCESS_SIGNAL
+		execution = hl_execution_find(*(__u64 *)arg);
+		if (!execution)
+			return 0;
+		execution->stopping = 1;
+		hl_async_cancel_execution(execution->id);
 		return -uk_process_kill_execution(*(__u64 *)arg);
 #else
 		return EOPNOTSUPP;
 #endif
+	}
 	case HLCALL_IOC_COMMAND_IO:
 		return hl_command_io(arg);
 	case HLCALL_IOC_COMMAND_EVENT: {
