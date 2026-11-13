@@ -1250,6 +1250,13 @@ static void hl_resume(void)
 #endif /* CONFIG_LIBUKRANDOM */
 
 	hl_async_negotiate();
+	if (hyperlight_execution_enabled) {
+		__u64 version;
+
+		if (hl_hcall_ulong("CommandDriverVersion", NULL, 0, &version) ||
+		    version != 5)
+			UK_CRASH("incompatible restored command driver\n");
+	}
 	hyperlight_console_resume();
 	hl_restores++;
 #if CONFIG_LIBUKRANDOM
