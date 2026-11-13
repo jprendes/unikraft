@@ -22,6 +22,9 @@
 #include <uk/sched.h>
 #include <uk/sched_impl.h>
 #include <uk/thread.h>
+#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
+#include <uk/process.h>
+#endif
 #if CONFIG_LIBDEVFS
 #include <vfscore/uio.h>
 #include <devfs/device.h>
@@ -862,6 +865,15 @@ static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
 		return EINVAL;
 
 	switch (cmd) {
+	case HLCALL_IOC_EXECUTION_KILL:
+		if (!hyperlight_execution_enabled || !*(__u64 *)arg ||
+		    uk_thread_current()->hyperlight_execution)
+			return EINVAL;
+#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
+		return -uk_process_kill_execution(*(__u64 *)arg);
+#else
+		return EOPNOTSUPP;
+#endif
 	case HLCALL_IOC_COMMAND_IO:
 		return hl_command_io(arg);
 	case HLCALL_IOC_COMMAND_EVENT: {
@@ -888,10 +900,10 @@ static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
 		__u64 version = 0;
 
 		if (hl_hcall_ulong("CommandDriverVersion", NULL, 0, &version) ||
-		    version != 1)
+		    version != 2)
 			return EOPNOTSUPP;
 		hyperlight_execution_enabled = 1;
-		*(__u64 *)arg = 1;
+		*(__u64 *)arg = 2;
 		return 0;
 	}
 	case HLCALL_IOC_MAXLEN:

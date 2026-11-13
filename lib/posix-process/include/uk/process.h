@@ -88,6 +88,13 @@ const void *uk_process_mmap_owner(void);
 int uk_sys_pause(void);
 int uk_sys_rt_sigsuspend(const void *sigmask, size_t sigsetsize);
 
+#if CONFIG_PLAT_HYPERLIGHT && CONFIG_LIBPOSIX_PROCESS_SIGNAL
+/* Signal every process in an execution, except the calling supervisor.
+ * Execution identity survives exec and reparenting.
+ */
+int uk_process_kill_execution(__u64 execution);
+#endif
+
 #if CONFIG_LIBPOSIX_PROCESS_MULTITHREADING
 
 /* Creates a pthread and attaches it to the current process

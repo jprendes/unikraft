@@ -411,6 +411,36 @@ static int pprocess_signal_process_one(struct posix_process *pproc,
 	return rc;
 }
 
+#if CONFIG_PLAT_HYPERLIGHT
+int uk_process_kill_execution(__u64 execution)
+{
+	struct posix_process *process;
+	struct posix_thread *thread, *next;
+	int error = 0;
+
+	if (!execution || !uk_pthread_current())
+		return -EINVAL;
+	uk_pprocess_foreach(process) {
+		if (process == uk_pprocess_current() ||
+		    process->pid == UK_PID_INIT ||
+		    process->state != POSIX_PROCESS_RUNNING)
+			continue;
+		uk_pprocess_foreach_pthread(process, thread, next) {
+			if (thread->thread &&
+			    thread->thread->hyperlight_execution == execution) {
+				int rc = pprocess_signal_process_one(process,
+								SIGKILL, NULL, true);
+
+				if (rc)
+					error = rc;
+				break;
+			}
+		}
+	}
+	return error;
+}
+#endif
+
 int pprocess_signal_notify_parent(struct posix_process *parent, int signum)
 {
 	struct posix_thread *thread, *threadn;
