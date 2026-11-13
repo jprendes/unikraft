@@ -61,3 +61,4 @@ tgkill
 signalfd
 uk_posix_process_create_pthread
 uk_posix_process_run
+uk_process_kill_matching

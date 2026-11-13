@@ -22,6 +22,10 @@
 #include <uk/sched.h>
 #include <uk/sched_impl.h>
 #include <uk/thread.h>
+#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
+#include <uk/process.h>
+static int hl_execution_kill_processes(__u64 id);
+#endif
 #if CONFIG_LIBDEVFS
 #include <vfscore/uio.h>
 #include <devfs/device.h>
@@ -315,6 +319,20 @@ static void hl_execution_thread_term(struct uk_thread *thread)
 
 UK_THREAD_INIT_PRIO_FLAGS(hl_execution_thread_init, hl_execution_thread_term,
 			 0, 0);
+
+#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
+static bool hl_execution_matches(const struct uk_thread *thread, void *arg)
+{
+	return hl_thread_execution(thread) == *(__u64 *)arg;
+}
+
+static int hl_execution_kill_processes(__u64 id)
+{
+	if (!id)
+		return -EINVAL;
+	return uk_process_kill_matching(hl_execution_matches, &id);
+}
+#endif
 
 static void hl_async_negotiate(void)
 {
@@ -949,6 +967,15 @@ static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
 		return EINVAL;
 
 	switch (cmd) {
+	case HLCALL_IOC_EXECUTION_KILL:
+		if (!hyperlight_execution_enabled || !*(__u64 *)arg ||
+		    hl_thread_execution(uk_thread_current()))
+			return EINVAL;
+#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
+		return -hl_execution_kill_processes(*(__u64 *)arg);
+#else
+		return EOPNOTSUPP;
+#endif
 	case HLCALL_IOC_COMMAND_IO:
 		return hl_command_io(arg);
 	case HLCALL_IOC_COMMAND_EVENT: {
@@ -975,10 +1002,10 @@ static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
 		__u64 version = 0;
 
 		if (hl_hcall_ulong("CommandDriverVersion", NULL, 0, &version) ||
-		    version != 1)
+		    version != 2)
 			return EOPNOTSUPP;
 		hyperlight_execution_enabled = 1;
-		*(__u64 *)arg = 1;
+		*(__u64 *)arg = 2;
 		return 0;
 	}
 	case HLCALL_IOC_MAXLEN:

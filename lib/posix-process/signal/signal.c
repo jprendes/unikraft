@@ -411,6 +411,34 @@ static int pprocess_signal_process_one(struct posix_process *pproc,
 	return rc;
 }
 
+int uk_process_kill_matching(bool (*match)(const struct uk_thread *, void *),
+			     void *arg)
+{
+	struct posix_process *process;
+	struct posix_thread *thread, *next;
+	int error = 0;
+
+	if (!match || !uk_pthread_current())
+		return -EINVAL;
+	uk_pprocess_foreach(process) {
+		if (process == uk_pprocess_current() ||
+		    process->pid == UK_PID_INIT ||
+		    process->state != POSIX_PROCESS_RUNNING)
+			continue;
+		uk_pprocess_foreach_pthread(process, thread, next) {
+			if (thread->thread && match(thread->thread, arg)) {
+				int rc = pprocess_signal_process_one(process,
+								SIGKILL, NULL, true);
+
+				if (rc)
+					error = rc;
+				break;
+			}
+		}
+	}
+	return error;
+}
+
 int pprocess_signal_notify_parent(struct posix_process *parent, int signum)
 {
 	struct posix_thread *thread, *threadn;
