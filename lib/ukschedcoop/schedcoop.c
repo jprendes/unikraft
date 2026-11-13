@@ -36,7 +36,34 @@
 #include <uk/sched_impl.h>
 #include <uk/schedcoop.h>
 #include <uk/essentials.h>
+#include <uk/schedcoop_policy.h>
 #include "schedcoop.h"
+
+#include <uk/event.h>
+
+UK_EVENT(UK_SCHEDCOOP_ELIGIBILITY_EVENT);
+
+static int schedcoop_eligible(const struct uk_thread *thread)
+{
+	struct uk_schedcoop_eligibility_event_data event = {
+		.thread = thread,
+		.eligible = true
+	};
+	int ret = uk_raise_event(UK_SCHEDCOOP_ELIGIBILITY_EVENT, &event);
+
+	UK_ASSERT(ret >= 0);
+	return event.eligible;
+}
+
+static struct uk_thread *schedcoop_next(struct schedcoop *c)
+{
+	struct uk_thread *thread;
+
+	UK_TAILQ_FOREACH(thread, &c->run_queue, queue)
+		if (schedcoop_eligible(thread))
+			return thread;
+	return NULL;
+}
 
 static void schedcoop_schedule(struct uk_sched *s)
 {
@@ -71,6 +98,8 @@ static void schedcoop_schedule(struct uk_sched *s)
 	min_wakeup_time = 0;
 	UK_TAILQ_FOREACH_SAFE(thread, &c->sleep_queue,
 			      queue, tmp) {
+		if (!schedcoop_eligible(thread))
+			continue;
 		if (likely(thread->wakeup_time)) {
 			if (thread->wakeup_time <= now)
 				uk_thread_wake(thread);
@@ -80,7 +109,7 @@ static void schedcoop_schedule(struct uk_sched *s)
 		}
 	}
 
-	next = UK_TAILQ_FIRST(&c->run_queue);
+	next = schedcoop_next(c);
 	if (next) {
 		UK_ASSERT(next != prev);
 		UK_ASSERT(uk_thread_is_runnable(next));
@@ -94,7 +123,7 @@ static void schedcoop_schedule(struct uk_sched *s)
 		    && !uk_thread_is_exited(prev))
 			UK_TAILQ_INSERT_TAIL(&c->run_queue, prev,
 					     queue);
-	} else if (uk_thread_is_runnable(prev)
+	} else if (schedcoop_eligible(prev) && uk_thread_is_runnable(prev)
 		   && !uk_thread_is_exited(prev)) {
 		next = prev;
 	} else {
@@ -206,7 +235,7 @@ static __noreturn void idle_thread_fn(void *argp)
 		 *        scheduler has always something to schedule.
 		 */
 		if (uk_sched_thread_gc(&c->sched) > 0 ||
-		    UK_TAILQ_FIRST(&c->run_queue)) {
+		    schedcoop_next(c)) {
 			/* We collected successfully some garbage or there is
 			 * a runnable thread in the queue.
 			 * Check if something else can be scheduled now.

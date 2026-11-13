@@ -157,7 +157,7 @@ struct hlcall_hostcall {
  */
 #define HLCALL_IOC_RESTORES _IOR('H', 4, __u64)
 
-/* Command protocol v3: root exit terminates the remaining guest descendants. */
+/* Command protocol v4: each entry selects one execution for scheduling. */
 #define HLCALL_IOC_EXECUTION _IOW('H', 5, __u64)
 #define HLCALL_IOC_COMMAND_DRIVER _IOR('H', 6, __u64)
 struct hl_command_event {
@@ -175,6 +175,7 @@ struct hl_command_io {
 #define HLCALL_IOC_EXECUTION_KILL _IOW('H', 9, __u64)
 
 extern int hyperlight_execution_enabled;
+extern __u64 hyperlight_execution_active;
 struct uk_thread;
 __u64 hl_thread_execution(const struct uk_thread *thread);
 void hl_thread_set_execution(struct uk_thread *thread, __u64 execution);
