@@ -21,12 +21,15 @@
 #include <hyperlight/hcall.h>
 #include <hyperlight/postcard.h>
 #include <hyperlight/transport.h>
+#include <hyperlight/step.h>
+#include <uk/thread.h>
 
 /* The transport has one request/reply buffer pair. Disable preemption
  * while using it, and reject reentrant calls (including kernel logging).
  */
 static __spinlock g_hcall_lock = UKARCH_SPINLOCK_INITIALIZER();
 static int g_hcall_busy;
+static __u64 g_execution;
 
 static int hcall_enter(unsigned long *irqf)
 {
@@ -235,8 +238,31 @@ static int hl_call(const char *func_name, __u8 ret_type,
 	if (hcall_enter(&irqf) < 0)
 		return -1;
 	req = hl_transport_request_buf();
-	fc_len = req ? hl_pc_encode_call(req, hl_transport_payload_cap(),
-				func_name, ret_type, params, nparams, &control) : 0;
+	if (!req)
+		goto out;
+#if CONFIG_HYPERLIGHT_STEP
+	if (hyperlight_execution_enabled) {
+		struct uk_thread *thread = uk_thread_current();
+		__u64 execution = thread ? thread->hyperlight_execution : 0;
+
+		if (execution != g_execution) {
+			struct hl_param p = {
+				.type = HL_PV_HLULONG, .u64_val = execution
+			};
+			/* Context and call are one serialized transaction. */
+			fc_len = hl_pc_encode_call(req, hl_transport_payload_cap(),
+				"ExecutionContext", HL_RT_INT, &p, 1, &control);
+			if (!fc_len || hl_transport_call(fc_len, control,
+							&rd, &rl, &reply_control) ||
+			    hl_pc_decode_result(rd, rl, reply_control, &result) ||
+			    result.error || result.tag != 0 || result.value)
+				goto out;
+			g_execution = execution;
+		}
+	}
+#endif
+	fc_len = hl_pc_encode_call(req, hl_transport_payload_cap(),
+				  func_name, ret_type, params, nparams, &control);
 	t = fc_len ? hl_transport_call(fc_len, control, &rd, &rl,
 				       &reply_control) : HL_TRANSPORT_NOT_SENT;
 	if (t == 0) {
@@ -249,6 +275,7 @@ static int hl_call(const char *func_name, __u8 ret_type,
 	} else if (t == HL_TRANSPORT_BAD_REPLY) {
 		rc = HL_HCALL_BAD_RESULT;
 	}
+out:
 	hcall_exit(irqf);
 	return rc;
 }

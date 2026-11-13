@@ -80,6 +80,9 @@ struct uk_thread {
 
 	uk_thread_dtor_t dtor;		/**< User provided destructor */
 	void *priv;			/**< Private field, free for use */
+#if CONFIG_PLAT_HYPERLIGHT
+	__u64 hyperlight_execution;
+#endif
 
 	__nsec exec_time;		/**< Time the thread was scheduled */
 	const char *name;		/**< Reference to thread name */
