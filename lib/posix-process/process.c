@@ -150,6 +150,7 @@ struct posix_thread *pprocess_create_pthread(struct posix_process *pprocess,
 	pthread->parent = uk_pthread_current();
 	pthread->tid = tid;
 	pthread->thread = th;
+	uk_semaphore_init(&pthread->wait_semaphore, 0);
 
 	uk_thread_uktls_var(th, pthread_self) = pthread;
 
@@ -302,7 +303,6 @@ struct posix_process *pprocess_create(struct uk_alloc *a,
 	}
 #endif /* CONFIG_LIBPOSIX_PROCESS_SIGNAL */
 
-	uk_semaphore_init(&pprocess->wait_semaphore, 0);
 	uk_semaphore_init(&pprocess->exit_semaphore, 0);
 	uk_waitq_init(&pprocess->vfork_waitq);
 

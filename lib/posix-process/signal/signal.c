@@ -327,7 +327,7 @@ void pprocess_signal_interrupt(struct posix_process *pproc)
 			continue;
 		uk_thread_set_interrupted(t);
 		if (thread->state == POSIX_THREAD_BLOCKED_WAIT)
-			uk_semaphore_up(&pproc->wait_semaphore);
+			uk_semaphore_up(&thread->wait_semaphore);
 		/* Paused, possibly with the fatal signal blocked */
 		else if (thread->state == POSIX_THREAD_BLOCKED_SIGNAL)
 			uk_semaphore_up(&thread->signal->deliver_semaphore);

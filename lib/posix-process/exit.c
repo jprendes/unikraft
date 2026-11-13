@@ -128,17 +128,10 @@ static inline int signal_exit(struct posix_process *parent,
 void pprocess_wake_waiters(struct posix_process *pprocess)
 {
 	struct posix_thread *pt, *ptn;
-	int waiters = 0;
-
 	uk_pprocess_foreach_pthread(pprocess, pt, ptn) {
 		if (pt->state == POSIX_THREAD_BLOCKED_WAIT)
-			waiters++;
+			uk_semaphore_up(&pt->wait_semaphore);
 	}
-	/* A thread paused for a signal looks too (see pprocess_exit()) */
-	if (!waiters)
-		waiters = 1;
-	while (waiters--)
-		uk_semaphore_up(&pprocess->wait_semaphore);
 }
 
 /* Wait until no thread of @pprocess, the caller's, lends its stack to a

@@ -69,7 +69,6 @@ struct posix_process {
 #if CONFIG_LIBPOSIX_PROCESS_SIGNAL
 	struct uk_signal_pdesc *signal;
 #endif /* CONFIG_LIBPOSIX_PROCESS_SIGNAL */
-	struct uk_semaphore wait_semaphore;
 	struct uk_semaphore exit_semaphore;
 	/* Woken when a vfork child gives a thread its stack back */
 	struct uk_waitq vfork_waitq;
@@ -92,6 +91,7 @@ struct posix_process {
 };
 
 struct posix_thread {
+	struct uk_semaphore wait_semaphore;
 	pid_t tid;
 	struct posix_process *process;
 	struct posix_thread *parent;
