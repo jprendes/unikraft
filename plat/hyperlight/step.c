@@ -58,6 +58,7 @@ extern void hostfs_resume_list(const char *mounts, __sz mounts_len);
 extern int hostsock_rescan_events(void);
 /* Re-create the guest's host sockets after a snapshot restore. */
 extern void hostsock_resume(void);
+extern void hostsock_resume_execution(__u64 id);
 #endif /* CONFIG_LIBHOSTSOCK */
 
 /* The relative delay reported when a deadline fell due while control was
@@ -727,11 +728,13 @@ static void hl_async_finish(struct hl_async_wait *wait, const __u8 *reply,
 /* Wake only after socket/mount/clock restoration and never cancel an old ID
  * against the new host's request namespace.
  */
-static void hl_async_restore(void)
+static void hl_async_restore_execution(__u64 id)
 {
 	struct hl_async_wait *wait;
 
 	for (wait = hl_async_waiters; wait; wait = wait->next) {
+		if (wait->thread->hyperlight_execution != id)
+			continue;
 		/* Even a delivered waiter must leave the old ID namespace. */
 		wait->id = 0;
 		if (wait->done)
@@ -755,7 +758,7 @@ static int hl_async_deliver(const __u8 *buf, __u64 len)
 	    hl_async_u32(buf) != 1)
 		return -1;
 	count = hl_async_u32(buf + 4);
-	if (!count || count > 64)
+	if (count > 64)
 		return -1;
 	for (i = 0; i < count; i++) {
 		if (len - pos < 12)
@@ -766,8 +769,10 @@ static int hl_async_deliver(const __u8 *buf, __u64 len)
 		if (!n || n > hl_hcall_max_payload() || n > len - pos ||
 		    buf[pos] > 1)
 			return -1;
-		for (w = hl_async_waiters; w && w->id != id; w = w->next)
-			;
+		for (w = hl_async_waiters; w; w = w->next)
+			if (w->id == id && (!hyperlight_execution_enabled ||
+			    w->thread->hyperlight_execution == hyperlight_execution_active))
+				break;
 		if (!w || w->done)
 			return -1;
 		for (j = 0; j < i; j++)
@@ -973,10 +978,10 @@ static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
 		__u64 version = 0;
 
 		if (hl_hcall_ulong("CommandDriverVersion", NULL, 0, &version) ||
-		    version != 4)
+		    version != 5)
 			return EOPNOTSUPP;
 		hyperlight_execution_enabled = 1;
-		*(__u64 *)arg = 4;
+		*(__u64 *)arg = 5;
 		return 0;
 	}
 	case HLCALL_IOC_MAXLEN:
@@ -1267,7 +1272,7 @@ static void hl_resume(void)
 		hyperlight_resolv_apply();
 	}
 #if CONFIG_LIBDEVFS
-	hl_async_restore();
+	hl_async_restore_execution(0);
 #endif
 	/* The new host has not heard these yet. */
 	if (hl_call_opened)
@@ -1351,6 +1356,21 @@ void hyperlight_step_pump(const __u8 *fc, __u64 fc_len,
 		hl_resume();
 	else if (!hl_pc_name_is(call, hl_step_fn_name))
 		hl_route_call(fc, fc_len, call);
+
+#if CONFIG_LIBDEVFS
+	if (hyperlight_execution_enabled && hyperlight_execution_active) {
+		__s32 restore;
+
+		if (hl_hcall_int("ExecutionRestore", NULL, 0, &restore))
+			UK_CRASH("cannot restore command resources\n");
+		if (restore) {
+#ifdef CONFIG_LIBHOSTSOCK
+			hostsock_resume_execution(hyperlight_execution_active);
+#endif
+			hl_async_restore_execution(hyperlight_execution_active);
+		}
+	}
+#endif
 
 	hl_pump_active = 1;
 	hl_pump_idle = idle;

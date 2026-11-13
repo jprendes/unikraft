@@ -157,7 +157,7 @@ struct hlcall_hostcall {
  */
 #define HLCALL_IOC_RESTORES _IOR('H', 4, __u64)
 
-/* Command protocol v4: each entry selects one execution for scheduling. */
+/* Command protocol v5: scoped scheduling and resource reconstruction. */
 #define HLCALL_IOC_EXECUTION _IOW('H', 5, __u64)
 #define HLCALL_IOC_COMMAND_DRIVER _IOR('H', 6, __u64)
 struct hl_command_event {

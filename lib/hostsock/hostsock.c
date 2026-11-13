@@ -1367,11 +1367,16 @@ dead:
  *   still answers, and any thread parked on one is woken so a server gets
  *   back to accept().
  */
-void hostsock_resume(void)
+void hostsock_resume_execution(__u64 id)
 {
 	struct hostsock *hs;
+	struct uk_thread *thread = uk_thread_current();
+	__u64 previous = thread->hyperlight_execution;
 
+	thread->hyperlight_execution = id;
 	uk_list_for_each_entry(hs, &hostsock_all, list) {
+		if (hs->execution != id)
+			continue;
 		switch (hs->state) {
 		case HS_CONNECTED:
 			hs->host_fd = -1;
@@ -1388,10 +1393,16 @@ void hostsock_resume(void)
 	}
 	/* Wake whoever is parked on a connection that just died. */
 	uk_list_for_each_entry(hs, &hostsock_all, list)
-		if (hs->psock && hs->state == HS_DEAD)
+		if (hs->execution == id && hs->psock && hs->state == HS_DEAD)
 			hostsock_publish_events(hs->psock,
 						POLLIN | POLLOUT | POLLHUP,
 						POLLIN | POLLOUT);
+	thread->hyperlight_execution = previous;
+}
+
+void hostsock_resume(void)
+{
+	hostsock_resume_execution(0);
 }
 
 /* ── Driver registration ─────────────────────────────────────────── */
