@@ -1049,6 +1049,17 @@ static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
 
 		if (!hl_thread_execution(uk_thread_current()))
 			return EPERM;
+		if (event->kind == 1) {
+#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
+			int error = hl_execution_kill_processes(
+				hl_thread_execution(uk_thread_current()));
+
+			if (error)
+				return -error;
+#else
+			return EOPNOTSUPP;
+#endif
+		}
 		return hl_hcall_int("CommandEvent", p, 2, &status) ? EIO : status;
 	}
 	case HLCALL_IOC_EXECUTION:
@@ -1063,10 +1074,10 @@ static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
 		__u64 version = 0;
 
 		if (hl_hcall_ulong("CommandDriverVersion", NULL, 0, &version) ||
-		    version != 2)
+		    version != 3)
 			return EOPNOTSUPP;
 		hyperlight_execution_enabled = 1;
-		*(__u64 *)arg = 2;
+		*(__u64 *)arg = 3;
 		return 0;
 	}
 	case HLCALL_IOC_MAXLEN:

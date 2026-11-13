@@ -157,7 +157,7 @@ struct hlcall_hostcall {
  */
 #define HLCALL_IOC_RESTORES _IOR('H', 4, __u64)
 
-/* Command protocol v2: attach a driver worker to a host execution tree. */
+/* Command protocol v3: root exit terminates the remaining guest descendants. */
 #define HLCALL_IOC_EXECUTION _IOW('H', 5, __u64)
 #define HLCALL_IOC_COMMAND_DRIVER _IOR('H', 6, __u64)
 struct hl_command_event {
