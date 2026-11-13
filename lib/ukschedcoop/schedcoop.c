@@ -132,10 +132,13 @@ static void schedcoop_schedule(struct uk_sched *s)
 		 * We select the idle thread only if we do not have anything
 		 * else to execute
 		 */
-		c->idle_return_time = min_wakeup_time;
 		next = &c->idle;
 		uk_sched_stats_idle_count_incr(s);
 	}
+
+	/* A different execution may be selected while idle is suspended. */
+	if (next == &c->idle)
+		c->idle_return_time = min_wakeup_time;
 
 	if (next != prev) {
 		/*
