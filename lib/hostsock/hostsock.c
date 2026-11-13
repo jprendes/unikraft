@@ -30,6 +30,7 @@
 #include <stdio.h>
 
 #include <hyperlight/hcall.h>
+#include <hyperlight/step.h>
 
 /*
  * Transfer buffers, sized from the host's G2H pool (hl_hcall_max_payload)
@@ -1256,7 +1257,9 @@ int hostsock_rescan_events(void)
 		/* Never polled, or dead: published once then, nothing more
 		 * can happen to it.
 		 */
-		if (!hs->psock || hs->state == HS_DEAD)
+		if (!hs->psock || hs->state == HS_DEAD ||
+		    (hyperlight_execution_enabled &&
+		     hs->execution != hyperlight_execution_active))
 			continue;
 		thread->hyperlight_execution = hs->execution;
 		revents = hostsock_check_ready(hs->host_fd, POLLIN | POLLOUT);

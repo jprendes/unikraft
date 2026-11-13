@@ -172,6 +172,7 @@ static const char hl_step_fn_name[] = "step";
 static const char hl_async_step_fn_name[] = "step_async";
 static int hl_async_supported;
 int hyperlight_execution_enabled;
+__u64 hyperlight_execution_active;
 
 struct hl_execution {
 	struct hl_execution *next;
@@ -902,7 +903,7 @@ static int hl_command_io(struct hl_command_io *io)
 		len = completed;
 	}
 	if (len == 5 && reply[0] == 1)
-		return fb_u32(reply, 1);
+		return hl_async_u32(reply + 1);
 	if (!len || reply[0] != 0 || (!io->stream && len - 1 > io->len))
 		return EPROTO;
 	if (!io->stream && len > 1)
@@ -972,10 +973,10 @@ static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
 		__u64 version = 0;
 
 		if (hl_hcall_ulong("CommandDriverVersion", NULL, 0, &version) ||
-		    version != 3)
+		    version != 4)
 			return EOPNOTSUPP;
 		hyperlight_execution_enabled = 1;
-		*(__u64 *)arg = 3;
+		*(__u64 *)arg = 4;
 		return 0;
 	}
 	case HLCALL_IOC_MAXLEN:
@@ -1060,7 +1061,9 @@ static void hl_execution_timers(void)
 	if (!hyperlight_execution_enabled)
 		return;
 	UK_TAILQ_FOREACH(thread, &uk_sched_current()->thread_list, thread_list) {
-		if (!thread->hyperlight_execution || thread->wakeup_time <= 0 ||
+		if (!thread->hyperlight_execution ||
+		    thread->hyperlight_execution != hyperlight_execution_active ||
+		    thread->wakeup_time <= 0 ||
 		    uk_thread_is_exited(thread))
 			continue;
 		records[count++] = thread->hyperlight_execution;
@@ -1328,6 +1331,11 @@ void hyperlight_step_pump(const __u8 *fc, __u64 fc_len,
 			   "schedulable guest\n");
 		return;
 	}
+
+	if (hyperlight_execution_enabled &&
+	    hl_hcall_ulong("ExecutionActive", NULL, 0,
+			 &hyperlight_execution_active))
+		UK_CRASH("cannot select command execution\n");
 
 	if (hl_pc_name_is(call, hl_async_step_fn_name)) {
 #if CONFIG_LIBDEVFS
