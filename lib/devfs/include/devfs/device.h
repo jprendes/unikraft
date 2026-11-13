@@ -71,6 +71,8 @@ struct devinfo {
 #define D_TTY		0x00000010
 /* Driver serializes its ioctls, which may park independently. */
 #define D_IOCTL_UNLOCKED	0x00000020
+/* Driver serializes reads, allowing control ioctls while a reader parks. */
+#define D_READ_UNLOCKED	0x00000040
 
 typedef int (*devop_open_t)(struct device *, int);
 typedef int (*devop_close_t)(struct device *);

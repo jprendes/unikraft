@@ -112,7 +112,18 @@ static int
 devfs_read(struct vnode *vp, struct vfscore_file *fp __unused,
 			struct uio *uio, int ioflags)
 {
-	return device_read((struct device *)vp->v_data, uio, ioflags);
+	struct device *dev = (struct device *)vp->v_data;
+	int unlocked = dev->flags & D_READ_UNLOCKED;
+	int error;
+
+	if (unlocked) {
+		vn_unlock(vp);
+	}
+	error = device_read(dev, uio, ioflags);
+	if (unlocked) {
+		vn_lock(vp);
+	}
+	return error;
 }
 
 static int

@@ -168,6 +168,153 @@ static void hl_emit_yield(__u64 ns)
 static const char hl_step_fn_name[] = "step";
 static const char hl_async_step_fn_name[] = "step_async";
 static int hl_async_supported;
+int hyperlight_execution_enabled;
+
+struct hl_execution {
+	struct hl_execution *next;
+	__u64 id;
+	unsigned int threads;
+};
+static struct hl_execution *hl_executions;
+
+static int hl_execution_get(__u64 id)
+{
+	struct hl_execution *execution;
+
+	for (execution = hl_executions; execution; execution = execution->next)
+		if (execution->id == id) {
+			execution->threads++;
+			return 0;
+		}
+	execution = uk_malloc(uk_alloc_get_default(), sizeof(*execution));
+	if (!execution)
+		return -ENOMEM;
+	*execution = (struct hl_execution) {
+		.next = hl_executions, .id = id, .threads = 1
+	};
+	hl_executions = execution;
+	return 0;
+}
+
+static __thread __u64 hl_execution_id;
+static __sptr hl_execution_tls_offset;
+static int hl_execution_tls_ready;
+
+/* Readiness workers deliberately have no UKTLS or POSIX state. */
+struct hl_thread_execution {
+	struct hl_thread_execution *next;
+	const struct uk_thread *thread;
+	__u64 id;
+};
+
+static struct hl_thread_execution *hl_bare_threads;
+
+__u64 hl_thread_execution(const struct uk_thread *thread)
+{
+	struct hl_thread_execution *state;
+
+	if (!thread)
+		return 0;
+	if (thread->flags & UK_THREADF_UKTLS) {
+		UK_ASSERT(hl_execution_tls_ready);
+		return *(__u64 *)(thread->uktlsp + hl_execution_tls_offset);
+	}
+	for (state = hl_bare_threads; state; state = state->next)
+		if (state->thread == thread)
+			return state->id;
+	return 0;
+}
+
+void hl_thread_set_execution(struct uk_thread *thread, __u64 execution)
+{
+	struct hl_thread_execution *state;
+
+	UK_ASSERT(thread);
+	if (thread->flags & UK_THREADF_UKTLS) {
+		UK_ASSERT(hl_execution_tls_ready);
+		*(__u64 *)(thread->uktlsp + hl_execution_tls_offset) = execution;
+		return;
+	}
+	for (state = hl_bare_threads; state; state = state->next)
+		if (state->thread == thread) {
+			state->id = execution;
+			return;
+		}
+	UK_CRASH("execution state missing for bare thread %s\n", thread->name);
+}
+
+static int hl_execution_thread_init(struct uk_thread *child,
+				    struct uk_thread *parent)
+{
+	struct hl_thread_execution *state = NULL;
+	int ret;
+
+	if (child->flags & UK_THREADF_UKTLS) {
+		/* Init callbacks run with the child's TLS. Cache the offset so
+		 * bare workers can access a foreign thread without their own TLS.
+		 */
+		hl_execution_tls_offset =
+			(__uptr)&hl_execution_id - uk_lcpu_tlsp_get();
+		hl_execution_tls_ready = 1;
+	} else {
+		state = uk_malloc(uk_alloc_get_default(), sizeof(*state));
+		if (!state)
+			return -ENOMEM;
+		*state = (struct hl_thread_execution) {
+			.next = hl_bare_threads, .thread = child
+		};
+		hl_bare_threads = state;
+	}
+	hl_thread_set_execution(child, parent ? hl_thread_execution(parent) : 0);
+	ret = hl_thread_execution(child) ?
+		hl_execution_get(hl_thread_execution(child)) : 0;
+	if (ret < 0 && state) {
+		hl_bare_threads = state->next;
+		uk_free(uk_alloc_get_default(), state);
+	}
+	return ret;
+}
+
+static void hl_execution_thread_put(struct uk_thread *thread)
+{
+	struct hl_execution **link = &hl_executions;
+	struct hl_execution *execution;
+	struct uk_thread *current = uk_thread_current();
+	__u64 previous = hl_thread_execution(current);
+	__s32 status;
+
+	if (!hl_thread_execution(thread))
+		return;
+	while ((execution = *link) && execution->id != hl_thread_execution(thread))
+		link = &execution->next;
+	UK_ASSERT(execution && execution->threads);
+	if (--execution->threads)
+		return;
+	hl_thread_set_execution(current, execution->id);
+	if (hl_hcall_int("ExecutionDone", NULL, 0, &status) || status)
+		UK_CRASH("cannot report execution completion\n");
+	hl_thread_set_execution(current, previous);
+	*link = execution->next;
+	uk_free(uk_alloc_get_default(), execution);
+}
+
+static void hl_execution_thread_term(struct uk_thread *thread)
+{
+	struct hl_thread_execution **link;
+
+	hl_execution_thread_put(thread);
+	for (link = &hl_bare_threads; *link; link = &(*link)->next)
+		if ((*link)->thread == thread) {
+			struct hl_thread_execution *state = *link;
+
+			*link = state->next;
+			uk_free(uk_alloc_get_default(), state);
+			break;
+		}
+}
+
+UK_THREAD_INIT_PRIO_FLAGS(hl_execution_thread_init, hl_execution_thread_term,
+			 0, 0);
 
 static void hl_async_negotiate(void)
 {
@@ -395,6 +542,8 @@ static int hlcall_read(struct device *dev __unused, struct uio *uio,
 
 	if (unlikely(!uio->uio_iov || uio->uio_iovcnt < 1))
 		return EINVAL;
+	if (hl_call_reader && hl_call_reader != uk_thread_current())
+		return EBUSY;
 	buf = uio->uio_iov->iov_base;
 	cap = uio->uio_iov->iov_len;
 
@@ -513,7 +662,10 @@ static void hl_async_cancel(__u64 id)
 static void hl_async_thread_term(struct uk_thread *thread)
 {
 	struct hl_async_wait *w = hl_async_waiters, *next;
+	struct uk_thread *current = uk_thread_current();
+	__u64 previous = hl_thread_execution(current);
 
+	hl_thread_set_execution(current, hl_thread_execution(thread));
 	while (w) {
 		next = w->next;
 		if (w->thread == thread) {
@@ -523,9 +675,10 @@ static void hl_async_thread_term(struct uk_thread *thread)
 		}
 		w = next;
 	}
+	hl_thread_set_execution(current, previous);
 }
 
-UK_THREAD_INIT_PRIO_FLAGS(0, hl_async_thread_term, 0, 0);
+UK_THREAD_INIT_PRIO_FLAGS(0, hl_async_thread_term, 1, 0);
 
 static __u32 hl_async_u32(const __u8 *p)
 {
@@ -694,7 +847,7 @@ static int hl_host_call(struct hlcall_hostcall *arg)
 	 */
 	if (unlikely(!hc.name || !hc.out || (hc.args_len && !hc.args)))
 		return EINVAL;
-	if (!hl_call_in_flight)
+	if (!hl_call_in_flight && !hl_thread_execution(uk_thread_current()))
 		return EPERM;
 	/* Both travel in one host call: together at most its payload.  The
 	 * encoder sizes them in 32 bits, so this also keeps it from
@@ -749,6 +902,41 @@ static int hl_host_call(struct hlcall_hostcall *arg)
  * HLCALL_IOC_GETENV: hand it the host's environment (see step.h).
  * HLCALL_IOC_RESTORES: how many times the guest was restored (step.h).
  */
+static int hl_command_io(struct hl_command_io *io)
+{
+	struct hl_param p[2];
+	__u8 reply[4105];
+	__sz len;
+	__u64 completed;
+	int error;
+
+	if (!hl_thread_execution(uk_thread_current()) ||
+	    io->stream > 2 || io->len > 4096 || (io->len && !io->buf))
+		return EINVAL;
+	p[0].type = HL_PV_HLULONG;
+	p[0].u64_val = io->stream;
+	p[1].type = HL_PV_HLVECBYTES;
+	p[1].vec.ptr = io->stream ? io->buf : (const __u8 *)"";
+	p[1].vec.len = io->stream ? io->len : 0;
+	if (hl_hcall_vecbytes("CommandIo", p, 2, reply, sizeof(reply), &len))
+		return EIO;
+	if (len == 9 && reply[0] == 2) {
+		error = hl_async_wait_for(hl_async_u64(reply + 1), reply,
+					 sizeof(reply), &completed);
+		if (error)
+			return error;
+		len = completed;
+	}
+	if (len == 5 && reply[0] == 1)
+		return fb_u32(reply, 1);
+	if (!len || reply[0] != 0 || (!io->stream && len - 1 > io->len))
+		return EPROTO;
+	if (!io->stream && len > 1)
+		memcpy(io->buf, reply + 1, len - 1);
+	io->done = io->stream ? io->len : len - 1;
+	return 0;
+}
+
 static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
 			void *arg)
 {
@@ -756,6 +944,38 @@ static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
 		return EINVAL;
 
 	switch (cmd) {
+	case HLCALL_IOC_COMMAND_IO:
+		return hl_command_io(arg);
+	case HLCALL_IOC_COMMAND_EVENT: {
+		struct hl_command_event *event = arg;
+		struct hl_param p[2] = {
+			{ .type = HL_PV_HLINT, .i32_val = event->kind },
+			{ .type = HL_PV_HLINT, .i32_val = event->value }
+		};
+		__s32 status;
+
+		if (!hl_thread_execution(uk_thread_current()))
+			return EPERM;
+		return hl_hcall_int("CommandEvent", p, 2, &status) ? EIO : status;
+	}
+	case HLCALL_IOC_EXECUTION:
+		if (!hyperlight_execution_enabled || !*(__u64 *)arg ||
+		    hl_thread_execution(uk_thread_current()))
+			return EINVAL;
+		if (hl_execution_get(*(__u64 *)arg))
+			return ENOMEM;
+		hl_thread_set_execution(uk_thread_current(), *(__u64 *)arg);
+		return 0;
+	case HLCALL_IOC_COMMAND_DRIVER: {
+		__u64 version = 0;
+
+		if (hl_hcall_ulong("CommandDriverVersion", NULL, 0, &version) ||
+		    version != 1)
+			return EOPNOTSUPP;
+		hyperlight_execution_enabled = 1;
+		*(__u64 *)arg = 1;
+		return 0;
+	}
 	case HLCALL_IOC_MAXLEN:
 		*(__u64 *)arg = hl_call_cap;
 		return 0;
@@ -803,7 +1023,7 @@ static int hlcall_register(struct uk_init_ctx *ictx __unused)
 	int rc;
 
 	rc = device_create(&hlcall_driver, "hlcall",
-			   D_CHR | D_IOCTL_UNLOCKED, NULL);
+			   D_CHR | D_IOCTL_UNLOCKED | D_READ_UNLOCKED, NULL);
 	if (unlikely(rc)) {
 		uk_pr_err("hyperlight: failed to register /dev/hlcall: %d\n",
 			  rc);
@@ -826,6 +1046,39 @@ static __u64 hl_ns_until(__nsec wakeup)
 		return 0;
 	now = ukplat_monotonic_clock();
 	return (wakeup > now) ? (__u64)(wakeup - now) : HL_STEP_DUE_NS;
+}
+
+static void hl_execution_timers(void)
+{
+	struct uk_thread *thread;
+	__u64 records[128];
+	unsigned int count = 0;
+	__s32 status;
+
+	if (!hyperlight_execution_enabled)
+		return;
+	UK_TAILQ_FOREACH(thread, &uk_sched_current()->thread_list, thread_list) {
+		if (!hl_thread_execution(thread) || thread->wakeup_time <= 0 ||
+		    uk_thread_is_exited(thread))
+			continue;
+		records[count++] = hl_thread_execution(thread);
+		records[count++] = hl_ns_until(thread->wakeup_time);
+		if (count == ARRAY_SIZE(records)) {
+			struct hl_param p = { .type = HL_PV_HLVECBYTES,
+				.vec = { .ptr = (const __u8 *)records,
+					 .len = count * sizeof(*records) } };
+			if (hl_hcall_int("ExecutionTimers", &p, 1, &status) || status)
+				UK_CRASH("cannot report execution timers\n");
+			count = 0;
+		}
+	}
+	if (count) {
+		struct hl_param p = { .type = HL_PV_HLVECBYTES,
+			.vec = { .ptr = (const __u8 *)records,
+				 .len = count * sizeof(*records) } };
+		if (hl_hcall_int("ExecutionTimers", &p, 1, &status) || status)
+			UK_CRASH("cannot report execution timers\n");
+	}
 }
 
 /* ── Yield thread ────────────────────────────────────────────────── */
@@ -1124,6 +1377,7 @@ void hyperlight_step_pump(const __u8 *fc, __u64 fc_len,
 	hl_pump_idle = NULL;
 	hl_pump_wakeup = 0;
 
+	hl_execution_timers();
 	hl_emit_yield(hl_ns_until(wakeup));
 }
 

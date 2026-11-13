@@ -157,6 +157,27 @@ struct hlcall_hostcall {
  */
 #define HLCALL_IOC_RESTORES _IOR('H', 4, __u64)
 
+/* Command protocol v1: attach a driver worker to a host execution tree. */
+#define HLCALL_IOC_EXECUTION _IOW('H', 5, __u64)
+#define HLCALL_IOC_COMMAND_DRIVER _IOR('H', 6, __u64)
+struct hl_command_event {
+	__s32 kind;
+	__s32 value;
+};
+struct hl_command_io {
+	__u64 stream;
+	void *buf;
+	__u64 len;
+	__u64 done;
+};
+#define HLCALL_IOC_COMMAND_EVENT _IOW('H', 7, struct hl_command_event)
+#define HLCALL_IOC_COMMAND_IO _IOWR('H', 8, struct hl_command_io)
+
+extern int hyperlight_execution_enabled;
+struct uk_thread;
+__u64 hl_thread_execution(const struct uk_thread *thread);
+void hl_thread_set_execution(struct uk_thread *thread, __u64 execution);
+
 #if CONFIG_HYPERLIGHT_STEP
 
 /**

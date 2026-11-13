@@ -83,6 +83,10 @@ enum hostsock_state {
 };
 
 struct hostsock {
+	__u64 execution;
+#if CONFIG_LIBDEVFS
+	struct hostsock_waiter *waiter;
+#endif
 	int host_fd;			/* host-side id; -1 once HS_DEAD */
 	int family, type, protocol;	/* socket() arguments */
 	enum hostsock_state state;
@@ -100,17 +104,25 @@ struct hostsock {
 static UK_LIST_HEAD(hostsock_all);
 
 #if CONFIG_LIBDEVFS
-static struct uk_thread *hostsock_waiter;
-static int hostsock_waiting;
+struct hostsock_waiter {
+	struct uk_list_head list;
+	struct uk_thread *thread;
+	__u64 execution;
+	int waiting;
+	unsigned int sockets;
+};
+static UK_LIST_HEAD(hostsock_waiters);
 static void hostsock_wait_loop(void *arg);
 #endif
 
 static void hostsock_wake_waiter(void)
 {
 #if CONFIG_LIBDEVFS
-	if (hostsock_waiter && !hostsock_waiting &&
-	    uk_thread_current() != hostsock_waiter)
-		uk_thread_wake(hostsock_waiter);
+	struct hostsock_waiter *waiter;
+
+	uk_list_for_each_entry(waiter, &hostsock_waiters, list)
+		if (!waiter->waiting && uk_thread_current() != waiter->thread)
+			uk_thread_wake(waiter->thread);
 #endif
 }
 
@@ -137,20 +149,37 @@ static struct hostsock *hs_new(int host_fd, int family, int type,
 	hs = uk_calloc(uk_alloc_get_default(), 1, sizeof(*hs));
 	if (unlikely(!hs))
 		return NULL;
+	hs->execution = hl_thread_execution(uk_thread_current());
 #if CONFIG_LIBDEVFS
-	if (!hostsock_waiter) {
+	struct hostsock_waiter *waiter, *found = NULL;
+
+	uk_list_for_each_entry(waiter, &hostsock_waiters, list)
+		if (waiter->execution == hs->execution)
+			found = waiter;
+	if (!found) {
+		waiter = uk_calloc(uk_alloc_get_default(), 1, sizeof(*waiter));
+		if (!waiter) {
+			uk_free(uk_alloc_get_default(), hs);
+			return NULL;
+		}
+		waiter->execution = hs->execution;
 		/* No TLS: this kernel worker must not inherit a process fd table. */
 		struct uk_thread *thread = uk_sched_thread_create_fn1(
-			uk_sched_current(), hostsock_wait_loop, NULL,
+			uk_sched_current(), hostsock_wait_loop, waiter,
 			0, 0, true, false, "hostsock_wait", NULL, NULL);
 
 		if (!thread || PTRISERR(thread)) {
 			uk_pr_err("hostsock: cannot create readiness waiter\n");
+			uk_free(uk_alloc_get_default(), waiter);
 			uk_free(uk_alloc_get_default(), hs);
 			return NULL;
 		}
-		hostsock_waiter = thread;
+		waiter->thread = thread;
+		uk_list_add_tail(&waiter->list, &hostsock_waiters);
+		found = waiter;
 	}
+	hs->waiter = found;
+	found->sockets++;
 #endif
 	hs->host_fd = host_fd;
 	hs->family = family;
@@ -163,6 +192,11 @@ static struct hostsock *hs_new(int host_fd, int family, int type,
 
 static void hs_free(struct hostsock *hs)
 {
+#if CONFIG_LIBDEVFS
+	UK_ASSERT(hs->waiter->sockets);
+	if (!--hs->waiter->sockets)
+		uk_thread_wake(hs->waiter->thread);
+#endif
 	uk_list_del(&hs->list);
 	uk_free(uk_alloc_get_default(), hs);
 }
@@ -941,10 +975,14 @@ static int
 hostsock_close(posix_sock *sock)
 {
 	struct hostsock *hs = hs_of(sock);
+	struct uk_thread *thread = uk_thread_current();
+	__u64 previous = hl_thread_execution(thread);
 	int err = 0;
 
+	hl_thread_set_execution(thread, hs->execution);
 	if (hs->state != HS_DEAD)
 		err = hc_close(hs->host_fd);
+	hl_thread_set_execution(thread, previous);
 	hs_free(hs);
 	return err;
 }
@@ -1208,6 +1246,8 @@ hostsock_poll_setup(posix_sock *sock)
 int hostsock_rescan_events(void)
 {
 	struct hostsock *hs;
+	struct uk_thread *thread = uk_thread_current();
+	__u64 previous = hl_thread_execution(thread);
 	int woke = 0;
 
 	uk_list_for_each_entry(hs, &hostsock_all, list) {
@@ -1218,12 +1258,14 @@ int hostsock_rescan_events(void)
 		 */
 		if (!hs->psock || hs->state == HS_DEAD)
 			continue;
+		hl_thread_set_execution(thread, hs->execution);
 		revents = hostsock_check_ready(hs->host_fd, POLLIN | POLLOUT);
 		if (hostsock_publish_events(hs->psock, revents,
 					    POLLIN | POLLOUT))
 			woke = 1;
 	}
 
+	hl_thread_set_execution(thread, previous);
 	hostsock_wake_waiter();
 	return woke;
 }
@@ -1233,15 +1275,17 @@ int hostsock_rescan_events(void)
  * The socket operations remain nonblocking, including poll/select callers.
  * The completion pump rescans sockets before scheduling this thread again.
  */
-static void hostsock_wait_loop(void *arg __unused)
+static void hostsock_wait_loop(void *arg)
 {
-	for (;;) {
+	struct hostsock_waiter *waiter = arg;
+
+	while (waiter->sockets) {
 		__s32 result;
 		int rc;
 
-		hostsock_waiting = 1;
+		waiter->waiting = 1;
 		rc = hl_hcall_async_int("net_wait_async", NULL, 0, &result);
-		hostsock_waiting = 0;
+		waiter->waiting = 0;
 		if (rc < 0)
 			result = rc;
 		if (result == -EINTR)
@@ -1254,6 +1298,9 @@ static void hostsock_wait_loop(void *arg __unused)
 		if (result < 0)
 			UK_CRASH("hostsock: readiness wait failed (%d)\n", result);
 	}
+	uk_list_del(&waiter->list);
+	uk_free(uk_alloc_get_default(), waiter);
+	uk_sched_thread_exit();
 }
 #endif
 
