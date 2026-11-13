@@ -625,6 +625,11 @@ static int hl_async_wait_for(__u64 id, __u8 *out, __u64 cap, __u64 *len)
 	};
 	hl_async_waiters = wait;
 	while (!wait->done) {
+		if (uk_thread_is_interrupted(wait->thread)) {
+			hl_async_cancel(wait->id);
+			hl_async_remove(wait);
+			return EINTR;
+		}
 		uk_thread_block(wait->thread);
 		uk_sched_yield();
 	}
