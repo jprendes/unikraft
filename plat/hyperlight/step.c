@@ -118,6 +118,7 @@ static void hl_emit_done(__s32 status, const __u8 *buf, __u64 len)
 
 #define HL_YIELD_STARTED 1
 #define HL_YIELD_DONE    2
+static void hl_command_yield(struct hl_param *params);
 
 /* What the entry saw of the call in flight, for its Yield. */
 static int hl_start_pending;
@@ -143,7 +144,7 @@ static void hl_step_forget_pending(void)
  */
 static void hl_emit_yield(__u64 ns)
 {
-	struct hl_param p[4];
+	struct hl_param p[5];
 	__s32 out, flags = 0;
 
 	if (hl_done_pending)
@@ -160,7 +161,10 @@ static void hl_emit_yield(__u64 ns)
 	p[3].type = HL_PV_HLVECBYTES;
 	p[3].vec.ptr = hl_done_pending && hl_result_len ? hl_result_buf : (const __u8 *)"";
 	p[3].vec.len = hl_done_pending ? (__u32)hl_result_len : 0;
-	(void)hl_hcall_int("Yield", p, 4, &out);
+	if (hyperlight_execution_enabled)
+		hl_command_yield(p);
+	else
+		(void)hl_hcall_int("Yield", p, 4, &out);
 	hl_step_forget_pending();
 }
 
@@ -179,9 +183,82 @@ struct hl_execution {
 	struct hl_execution *next;
 	__u64 id;
 	unsigned int threads;
+	unsigned int stdio;
 	int stopping;
+	__s32 driver, root, status, error;
+	__u32 events;
 };
 static struct hl_execution *hl_executions;
+#define HL_EXEC_STARTED 1U
+#define HL_EXEC_EXITED  2U
+#define HL_EXEC_DONE    4U
+#define HL_EXEC_EOF(s)  (8U << (s))
+#define HL_EXEC_ERROR  64U
+
+struct hl_execution_event {
+	__u64 id;
+	__s32 pid, status, error;
+	__u32 flags;
+};
+
+static void hl_command_yield(struct hl_param *params)
+{
+	struct hl_execution_event records[64];
+	struct hl_execution **link = &hl_executions, *execution;
+	unsigned int count = 0;
+	__s32 status;
+
+	while ((execution = *link)) {
+		if (!execution->threads)
+			execution->events |= HL_EXEC_DONE;
+		if (execution->events) {
+			if (count == ARRAY_SIZE(records)) {
+				struct hl_param p = {
+					.type = HL_PV_HLVECBYTES,
+					.vec = { .ptr = (const __u8 *)records,
+						 .len = sizeof(records) }
+				};
+
+				if (hl_hcall_int("ExecutionEvents", &p, 1,
+						 &status) || status)
+					UK_CRASH("cannot report command events\n");
+				count = 0;
+			}
+			records[count++] = (struct hl_execution_event) {
+				.id = execution->id, .pid = execution->root,
+				.status = execution->status,
+				.error = execution->error,
+				.flags = execution->events
+			};
+			execution->events = 0;
+		}
+		if (!execution->threads) {
+			*link = execution->next;
+			uk_free(uk_alloc_get_default(), execution);
+		} else {
+			link = &execution->next;
+		}
+	}
+	params[4] = (struct hl_param) {
+		.type = HL_PV_HLVECBYTES,
+		.vec = { .ptr = (const __u8 *)records,
+			 .len = count * sizeof(*records) }
+	};
+	if (hl_hcall_int("CommandYield", params, 5, &status) || status)
+		UK_CRASH("cannot report command yield\n");
+}
+
+static int hl_command_negotiate(void)
+{
+	__u64 version;
+	__s32 status;
+
+	if (hl_hcall_ulong("CommandDriverVersion", NULL, 0, &version) ||
+	    version != 7 ||
+	    hl_hcall_int("CommandDriverReady", NULL, 0, &status) || status)
+		return -EOPNOTSUPP;
+	return 0;
+}
 
 #if CONFIG_LIBDEVFS
 static struct hl_execution *hl_execution_find(__u64 id)
@@ -232,25 +309,15 @@ static int hl_execution_thread_init(struct uk_thread *child,
 
 static void hl_execution_thread_term(struct uk_thread *thread)
 {
-	struct hl_execution **link = &hl_executions;
 	struct hl_execution *execution;
-	struct uk_thread *current = uk_thread_current();
-	__u64 previous = current->hyperlight_execution;
-	__s32 status;
 
 	if (!thread->hyperlight_execution)
 		return;
-	while ((execution = *link) && execution->id != thread->hyperlight_execution)
-		link = &execution->next;
+	for (execution = hl_executions; execution; execution = execution->next)
+		if (execution->id == thread->hyperlight_execution)
+			break;
 	UK_ASSERT(execution && execution->threads);
-	if (--execution->threads)
-		return;
-	current->hyperlight_execution = execution->id;
-	if (hl_hcall_int("ExecutionDone", NULL, 0, &status) || status)
-		UK_CRASH("cannot report execution completion\n");
-	current->hyperlight_execution = previous;
-	*link = execution->next;
-	uk_free(uk_alloc_get_default(), execution);
+	execution->threads--;
 }
 
 UK_THREAD_INIT_PRIO_FLAGS(hl_execution_thread_init, hl_execution_thread_term, 0, 0);
@@ -569,6 +636,9 @@ struct hl_async_wait {
 	struct hl_async_wait *next;
 	struct uk_thread *thread;
 	__u64 id;
+	__u64 execution;
+	hl_async_callback callback;
+	void *arg;
 	__u8 *out;
 	__u64 cap, len;
 	int done;
@@ -576,6 +646,8 @@ struct hl_async_wait {
 };
 
 static struct hl_async_wait *hl_async_waiters;
+static void hl_async_finish(struct hl_async_wait *wait, const __u8 *reply,
+			    __u64 len);
 
 static void hl_async_remove(struct hl_async_wait *wait)
 {
@@ -599,21 +671,63 @@ static void hl_async_cancel(__u64 id)
 
 static void hl_async_cancel_execution(__u64 id)
 {
-	struct hl_async_wait *wait;
+	struct hl_async_wait *wait, *next;
 	struct uk_thread *current = uk_thread_current();
 	__u64 previous = current->hyperlight_execution;
 
 	current->hyperlight_execution = id;
-	for (wait = hl_async_waiters; wait; wait = wait->next) {
-		if (wait->thread->hyperlight_execution != id || wait->done)
+	for (wait = hl_async_waiters; wait; wait = next) {
+		next = wait->next;
+		if (wait->execution != id || wait->done)
 			continue;
 		hl_async_cancel(wait->id);
 		wait->error = ECANCELED;
-		wait->done = 1;
-		uk_thread_wake(wait->thread);
+		hl_async_finish(wait, NULL, 0);
 	}
 	current->hyperlight_execution = previous;
 }
+
+void hl_execution_close(__u64 id, unsigned int stream)
+{
+	struct hl_execution *execution = hl_execution_find(id);
+
+	UK_ASSERT(execution && stream < 3);
+	execution->events |= HL_EXEC_EOF(stream);
+}
+
+#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
+static int hl_execution_clone(void *arg)
+{
+	struct posix_process_clone_event_data *event = arg;
+	struct hl_execution *execution =
+		hl_execution_find(event->child->hyperlight_execution);
+
+	if (execution && !execution->root && event->pid != event->ppid)
+		execution->root = event->pid;
+	return UK_EVENT_HANDLED_CONT;
+}
+
+POSIX_PROCESS_CLONE_HANDLER(0, hl_execution_clone);
+
+static int hl_execution_exit(void *arg)
+{
+	struct posix_process_ppexit_event_data *event = arg;
+	struct hl_execution *execution = hl_execution_find(event->execution);
+
+	if (!execution || execution->root != event->pid)
+		return UK_EVENT_NOT_HANDLED;
+	execution->status = event->status;
+	execution->events |= HL_EXEC_EXITED;
+	event->autoreap = true;
+	execution->stopping = 1;
+	hl_async_cancel_execution(execution->id);
+	if (uk_process_kill_execution(execution->id, execution->driver))
+		UK_CRASH("cannot terminate command descendants\n");
+	return UK_EVENT_HANDLED_CONT;
+}
+
+POSIX_PROCESS_PPEXIT_HANDLER(hl_execution_exit);
+#endif
 
 /* A killed thread must never receive a reply into its released stack. */
 static void hl_async_thread_term(struct uk_thread *thread)
@@ -648,6 +762,44 @@ static __u64 hl_async_u64(const __u8 *p)
 	return (__u64)hl_async_u32(p) | ((__u64)hl_async_u32(p + 4) << 32);
 }
 
+int hl_async_watch(__u64 id, hl_async_callback callback, void *arg,
+		   struct hl_async_wait **out)
+{
+	struct hl_async_wait *wait;
+
+	if (!hl_async_supported || !id)
+		return -EPROTO;
+	if (hl_execution_stopping()) {
+		hl_async_cancel(id);
+		return -ECANCELED;
+	}
+	wait = uk_calloc(uk_alloc_get_default(), 1, sizeof(*wait));
+	if (!wait) {
+		hl_async_cancel(id);
+		return -ENOMEM;
+	}
+	wait->next = hl_async_waiters;
+	wait->execution = uk_thread_current()->hyperlight_execution;
+	wait->id = id;
+	wait->callback = callback;
+	wait->arg = arg;
+	hl_async_waiters = wait;
+	*out = wait;
+	return 0;
+}
+
+void hl_async_unwatch(struct hl_async_wait *wait)
+{
+	struct uk_thread *current = uk_thread_current();
+	__u64 previous = current->hyperlight_execution;
+
+	current->hyperlight_execution = wait->execution;
+	if (wait->id && !wait->done)
+		hl_async_cancel(wait->id);
+	hl_async_remove(wait);
+	current->hyperlight_execution = previous;
+}
+
 static int hl_async_wait_for(__u64 id, __u8 *out, __u64 cap, __u64 *len)
 {
 	struct hl_async_wait *wait;
@@ -667,6 +819,7 @@ static int hl_async_wait_for(__u64 id, __u8 *out, __u64 cap, __u64 *len)
 	*wait = (struct hl_async_wait) {
 		.next = hl_async_waiters,
 		.thread = uk_thread_current(),
+		.execution = uk_thread_current()->hyperlight_execution,
 		.id = id,
 		.out = out,
 		.cap = cap,
@@ -718,8 +871,13 @@ int hl_hcall_async_int(const char *name, const struct hl_param *params,
 static void hl_async_finish(struct hl_async_wait *wait, const __u8 *reply,
 			    __u64 len)
 {
+	if (wait->callback) {
+		wait->callback(wait->arg, wait->error, reply, len);
+		hl_async_remove(wait);
+		return;
+	}
 	wait->len = len;
-	if (len <= wait->cap)
+	if (len && len <= wait->cap)
 		memcpy(wait->out, reply, len);
 	wait->done = 1;
 	uk_thread_wake(wait->thread);
@@ -730,19 +888,18 @@ static void hl_async_finish(struct hl_async_wait *wait, const __u8 *reply,
  */
 static void hl_async_restore_execution(__u64 id)
 {
-	struct hl_async_wait *wait;
+	struct hl_async_wait *wait, *next;
 
-	for (wait = hl_async_waiters; wait; wait = wait->next) {
-		if (wait->thread->hyperlight_execution != id)
+	for (wait = hl_async_waiters; wait; wait = next) {
+		next = wait->next;
+		if (wait->execution != id)
 			continue;
 		/* Even a delivered waiter must leave the old ID namespace. */
 		wait->id = 0;
 		if (wait->done)
 			continue;
 		wait->error = EINTR;
-		wait->len = 0;
-		wait->done = 1;
-		uk_thread_wake(wait->thread);
+		hl_async_finish(wait, NULL, 0);
 	}
 }
 
@@ -771,7 +928,7 @@ static int hl_async_deliver(const __u8 *buf, __u64 len)
 			return -1;
 		for (w = hl_async_waiters; w; w = w->next)
 			if (w->id == id && (!hyperlight_execution_enabled ||
-			    w->thread->hyperlight_execution == hyperlight_execution_active))
+			    w->execution == hyperlight_execution_active))
 				break;
 		if (!w || w->done)
 			return -1;
@@ -924,6 +1081,26 @@ static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
 		return EINVAL;
 
 	switch (cmd) {
+	case HLCALL_IOC_COMMAND_STDIO: {
+#if CONFIG_LIBPOSIX_FDTAB
+		struct hl_command_stdio *io = arg;
+		__u64 id = uk_thread_current()->hyperlight_execution;
+		struct hl_execution *execution = hl_execution_find(id);
+		int fd;
+
+		if (!execution || io->stream > 2 ||
+		    (execution->stdio & (1u << io->stream)))
+			return EINVAL;
+		fd = hl_stdio_open(io->stream);
+		if (fd < 0)
+			return -fd;
+		execution->stdio |= 1u << io->stream;
+		io->fd = fd;
+		return 0;
+#else
+		return EOPNOTSUPP;
+#endif
+	}
 	case HLCALL_IOC_EXECUTION_KILL: {
 		struct hl_execution *execution;
 
@@ -936,7 +1113,7 @@ static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
 			return 0;
 		execution->stopping = 1;
 		hl_async_cancel_execution(execution->id);
-		return -uk_process_kill_execution(*(__u64 *)arg);
+		return -uk_process_kill_execution(execution->id, execution->driver);
 #else
 		return EOPNOTSUPP;
 #endif
@@ -945,26 +1122,24 @@ static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
 		return hl_command_io(arg);
 	case HLCALL_IOC_COMMAND_EVENT: {
 		struct hl_command_event *event = arg;
-		struct hl_param p[2] = {
-			{ .type = HL_PV_HLINT, .i32_val = event->kind },
-			{ .type = HL_PV_HLINT, .i32_val = event->value }
-		};
-		__s32 status;
+		struct uk_thread *current = uk_thread_current();
+		struct hl_execution *execution =
+			hl_execution_find(current->hyperlight_execution);
 
-		if (!uk_thread_current()->hyperlight_execution)
+		if (!execution)
 			return EPERM;
-		if (event->kind == 1) {
-#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
-			int error = uk_process_kill_execution(
-				uk_thread_current()->hyperlight_execution);
-
-			if (error)
-				return -error;
-#else
-			return EOPNOTSUPP;
-#endif
+		if (event->kind || !event->value ||
+		    (event->value > 0 && event->value != execution->root))
+			return EINVAL;
+		if (event->value < 0) {
+			execution->error = -event->value;
+			execution->events |= HL_EXEC_ERROR;
+		} else {
+			execution->events |= HL_EXEC_STARTED;
 		}
-		return hl_hcall_int("CommandEvent", p, 2, &status) ? EIO : status;
+		hl_execution_thread_term(current);
+		current->hyperlight_execution = 0;
+		return 0;
 	}
 	case HLCALL_IOC_EXECUTION:
 		if (!hyperlight_execution_enabled || !*(__u64 *)arg ||
@@ -972,16 +1147,14 @@ static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
 			return EINVAL;
 		if (hl_execution_get(*(__u64 *)arg))
 			return ENOMEM;
+		hl_execution_find(*(__u64 *)arg)->driver = uk_sys_getpid();
 		uk_thread_current()->hyperlight_execution = *(__u64 *)arg;
 		return 0;
 	case HLCALL_IOC_COMMAND_DRIVER: {
-		__u64 version = 0;
-
-		if (hl_hcall_ulong("CommandDriverVersion", NULL, 0, &version) ||
-		    version != 5)
+		if (hl_command_negotiate())
 			return EOPNOTSUPP;
 		hyperlight_execution_enabled = 1;
-		*(__u64 *)arg = 5;
+		*(__u64 *)arg = 7;
 		return 0;
 	}
 	case HLCALL_IOC_MAXLEN:
@@ -1250,13 +1423,8 @@ static void hl_resume(void)
 #endif /* CONFIG_LIBUKRANDOM */
 
 	hl_async_negotiate();
-	if (hyperlight_execution_enabled) {
-		__u64 version;
-
-		if (hl_hcall_ulong("CommandDriverVersion", NULL, 0, &version) ||
-		    version != 5)
-			UK_CRASH("incompatible restored command driver\n");
-	}
+	if (hyperlight_execution_enabled && hl_command_negotiate())
+		UK_CRASH("incompatible restored command driver\n");
 	hyperlight_console_resume();
 	hl_restores++;
 #if CONFIG_LIBUKRANDOM
@@ -1325,6 +1493,7 @@ void hyperlight_step_pump(const __u8 *fc, __u64 fc_len,
 	struct uk_thread *idle;
 	unsigned long flags;
 	__nsec wakeup;
+	int restore = 0;
 
 	/* The const is dropped because uk_sched_thread_switch() needs a
 	 * mutable handle; the idle thread object is legitimately mutable.
@@ -1344,10 +1513,16 @@ void hyperlight_step_pump(const __u8 *fc, __u64 fc_len,
 		return;
 	}
 
-	if (hyperlight_execution_enabled &&
-	    hl_hcall_ulong("ExecutionActive", NULL, 0,
-			 &hyperlight_execution_active))
-		UK_CRASH("cannot select command execution\n");
+	if (hyperlight_execution_enabled) {
+		__u8 reply[9];
+		__sz len;
+
+		if (hl_hcall_vecbytes("ExecutionEnter", NULL, 0, reply,
+				      sizeof(reply), &len) || len != sizeof(reply))
+			UK_CRASH("cannot select command execution\n");
+		memcpy(&hyperlight_execution_active, reply, sizeof(__u64));
+		restore = reply[8];
+	}
 
 	if (hl_pc_name_is(call, hl_async_step_fn_name)) {
 #if CONFIG_LIBDEVFS
@@ -1366,10 +1541,6 @@ void hyperlight_step_pump(const __u8 *fc, __u64 fc_len,
 
 #if CONFIG_LIBDEVFS
 	if (hyperlight_execution_enabled && hyperlight_execution_active) {
-		__s32 restore;
-
-		if (hl_hcall_int("ExecutionRestore", NULL, 0, &restore))
-			UK_CRASH("cannot restore command resources\n");
 		if (restore) {
 #ifdef CONFIG_LIBHOSTSOCK
 			hostsock_resume_execution(hyperlight_execution_active);

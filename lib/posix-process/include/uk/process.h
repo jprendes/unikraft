@@ -89,10 +89,11 @@ int uk_sys_pause(void);
 int uk_sys_rt_sigsuspend(const void *sigmask, size_t sigsetsize);
 
 #if CONFIG_PLAT_HYPERLIGHT && CONFIG_LIBPOSIX_PROCESS_SIGNAL
-/* Signal every process in an execution, except the calling supervisor.
- * Execution identity survives exec and reparenting.
+/* End every process in an execution, except its launch driver and init.
+ * May run from a process-exit hook without a POSIX caller. Execution identity
+ * survives exec and reparenting.
  */
-int uk_process_kill_execution(__u64 execution);
+int uk_process_kill_execution(__u64 execution, pid_t driver);
 #endif
 
 #if CONFIG_LIBPOSIX_PROCESS_MULTITHREADING

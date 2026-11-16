@@ -412,32 +412,27 @@ static int pprocess_signal_process_one(struct posix_process *pproc,
 }
 
 #if CONFIG_PLAT_HYPERLIGHT
-int uk_process_kill_execution(__u64 execution)
+int uk_process_kill_execution(__u64 execution, pid_t driver)
 {
 	struct posix_process *process;
 	struct posix_thread *thread, *next;
-	int error = 0;
 
-	if (!execution || !uk_pthread_current())
+	if (!execution || driver <= 0)
 		return -EINVAL;
 	uk_pprocess_foreach(process) {
-		if (process == uk_pprocess_current() ||
+		if (process->pid == driver ||
 		    process->pid == UK_PID_INIT ||
 		    process->state != POSIX_PROCESS_RUNNING)
 			continue;
 		uk_pprocess_foreach_pthread(process, thread, next) {
 			if (thread->thread &&
 			    thread->thread->hyperlight_execution == execution) {
-				int rc = pprocess_signal_process_one(process,
-								SIGKILL, NULL, true);
-
-				if (rc)
-					error = rc;
+				pprocess_signal_end(process, SIGKILL);
 				break;
 			}
 		}
 	}
-	return error;
+	return 0;
 }
 #endif
 

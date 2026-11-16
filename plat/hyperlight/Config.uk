@@ -64,6 +64,7 @@ config HYPERLIGHT_STEP
 	bool
 	default y
 	depends on LIBUKSCHED
+	select LIBUKFILE_POLLED if LIBDEVFS && LIBPOSIX_FDTAB
 	help
 	  Hand the vCPU back to the host whenever the scheduler would go
 	  idle, reporting the time until the next guest timer, instead of

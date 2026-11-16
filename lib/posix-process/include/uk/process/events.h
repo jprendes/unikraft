@@ -254,6 +254,11 @@ typedef void (*posix_process_ptexit_handler_fn)(void *event_data);
  */
 struct posix_process_ppexit_event_data {
 	pid_t pid;
+	int status; /* Linux wait status */
+	bool autoreap; /* Consume status; reap unless creation is rolling back. */
+#if CONFIG_PLAT_HYPERLIGHT
+	__u64 execution;
+#endif
 };
 
 /**

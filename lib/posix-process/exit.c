@@ -291,6 +291,15 @@ void pprocess_exit(struct posix_process *pprocess,
 	 * This must happen before we unblock wait(), so that threads
 	 * have already been released when we reap the process.
 	 */
+#if CONFIG_PLAT_HYPERLIGHT
+	event_data.execution = 0;
+	uk_pprocess_foreach_pthread(pprocess, pt, ptn) {
+		if (pt->thread && pt->thread->hyperlight_execution) {
+			event_data.execution = pt->thread->hyperlight_execution;
+			break;
+		}
+	}
+#endif
 	uk_pprocess_foreach_pthread(pprocess, pt, ptn)
 		pprocess_exit_pthread(pt, PP2PT_EXIT_STATE(state), exit_status);
 
@@ -311,7 +320,12 @@ void pprocess_exit(struct posix_process *pprocess,
 
 	/* Notify handlers */
 	event_data.pid = pprocess->pid;
+	event_data.status = state == POSIX_PROCESS_EXITED ?
+		pprocess->exit_status << 8 : pprocess->exit_status;
+	event_data.autoreap = nowait;
 	pprocess_raise_ppexit_event(&event_data);
+	/* Creation rollback unlinks the parent and owns the final release. */
+	nowait = event_data.autoreap && parent_process;
 
 	uk_semaphore_up(&pprocess->exit_semaphore);
 
