@@ -89,11 +89,12 @@ int uk_sys_pause(void);
 int uk_sys_rt_sigsuspend(const void *sigmask, size_t sigsetsize);
 
 #if CONFIG_LIBPOSIX_PROCESS_SIGNAL
-/* Signal running processes with a thread selected by @match, except
- * the caller and init. The predicate must not block or mutate process state.
+/* End running processes with a thread selected by @match, except @exclude
+ * and init. The predicate must not block or mutate process state.
+ * May run from a process-exit hook without a POSIX caller.
  */
 int uk_process_kill_matching(bool (*match)(const struct uk_thread *, void *),
-			     void *arg);
+			     void *arg, pid_t exclude);
 #endif
 
 #if CONFIG_LIBPOSIX_PROCESS_MULTITHREADING

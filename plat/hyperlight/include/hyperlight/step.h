@@ -157,7 +157,7 @@ struct hlcall_hostcall {
  */
 #define HLCALL_IOC_RESTORES _IOR('H', 4, __u64)
 
-/* Command protocol v5: scoped scheduling and resource reconstruction. */
+/* Command protocol v7: kernel supervision and batched lifecycle reports. */
 #define HLCALL_IOC_EXECUTION _IOW('H', 5, __u64)
 #define HLCALL_IOC_COMMAND_DRIVER _IOR('H', 6, __u64)
 struct hl_command_event {
@@ -173,12 +173,24 @@ struct hl_command_io {
 #define HLCALL_IOC_COMMAND_EVENT _IOW('H', 7, struct hl_command_event)
 #define HLCALL_IOC_COMMAND_IO _IOWR('H', 8, struct hl_command_io)
 #define HLCALL_IOC_EXECUTION_KILL _IOW('H', 9, __u64)
+struct hl_command_stdio { __u64 stream, fd; };
+#define HLCALL_IOC_COMMAND_STDIO _IOWR('H', 10, struct hl_command_stdio)
+
+struct hl_async_wait;
+typedef void (*hl_async_callback)(void *, int, const __u8 *, __u64);
+/* A callback wait owns no thread; its owner must unwatch before destruction. */
+int hl_async_watch(__u64 id, hl_async_callback callback, void *arg,
+		   struct hl_async_wait **out);
+void hl_async_unwatch(struct hl_async_wait *wait);
+int hl_stdio_open(unsigned int stream);
+void hl_execution_close(__u64 execution, unsigned int stream);
 
 extern int hyperlight_execution_enabled;
 extern __u64 hyperlight_execution_active;
 struct uk_thread;
 __u64 hl_thread_execution(const struct uk_thread *thread);
 void hl_thread_set_execution(struct uk_thread *thread, __u64 execution);
+__u64 hl_execution_for_pid(int pid);
 
 #if CONFIG_HYPERLIGHT_STEP
 

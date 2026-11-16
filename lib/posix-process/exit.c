@@ -311,7 +311,12 @@ void pprocess_exit(struct posix_process *pprocess,
 
 	/* Notify handlers */
 	event_data.pid = pprocess->pid;
+	event_data.status = state == POSIX_PROCESS_EXITED ?
+		pprocess->exit_status << 8 : pprocess->exit_status;
+	event_data.autoreap = nowait;
 	pprocess_raise_ppexit_event(&event_data);
+	/* Creation rollback unlinks the parent and owns the final release. */
+	nowait = event_data.autoreap && parent_process;
 
 	uk_semaphore_up(&pprocess->exit_semaphore);
 
