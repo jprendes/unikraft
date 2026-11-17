@@ -77,4 +77,14 @@ config HYPERLIGHT_STEP
 	  present, so there is no prompt: a kernel with threads but without
 	  the step model could not run a guest function at all.
 
+config HYPERLIGHT_COMMAND
+	bool "Kernel command launcher"
+	default y
+	depends on HYPERLIGHT_STEP && LIBDEVFS && LIBPOSIX_FDTAB
+	depends on LIBPOSIX_PROCESS_MULTIPROCESS && LIBPOSIX_PROCESS_EXECVE
+	depends on LIBPOSIX_PROCESS_SIGNAL && LIBUKBOOT_INIT
+	help
+	  Launch and terminate host-selected executable process trees without
+	  a runtime driver. Legacy interpreter and exec drivers remain usable.
+
 endif

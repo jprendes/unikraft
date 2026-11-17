@@ -101,10 +101,8 @@ int uk_process_kill_matching(bool (*match)(const struct uk_thread *, void *),
 
 /* Creates a pthread and attaches it to the current process
  *
- * DO NOT USE. This is only necessary when loading an ELF via initrd,
- * where we want to POSIXise the kernel thread, as initrd does not
- * support paths and therefore we cannot execve(). For more details
- * see the implementation of app-elfloader.
+ * Kernel-internal: used by the ELF initrd loader and kernel services that
+ * need POSIX state. The supplied thread must have Unikraft TLS.
  */
 int uk_posix_process_create_pthread(struct uk_thread *thread);
 
@@ -125,8 +123,8 @@ typedef __noreturn void (*uk_posix_process_mainlike_func)(void *argc,
 /**
  * Spawn a process that jumps into function.
  *
- * DO NOT USE. This is only necessary when we create a new process
- * for main() in multiprocess.
+ * Kernel-internal: used for main() and kernel-owned executable launching.
+ * The function must terminate the child or execve(), rather than return.
  *
  * @param fn      Function to jump to.
  * @param argc    Arg count

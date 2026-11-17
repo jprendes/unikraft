@@ -237,6 +237,9 @@ UK_SYSCALL_R_E_DEFINE(int, execve, const char *, pathname,
 	this_thread->_mem.stack_a = stack_a;
 	this_thread->ctx = loader_args.ctx;
 
+	/* Notification only: the new image is committed and cannot be rolled back. */
+	uk_raise_event(POSIX_PROCESS_EXECVE_COMMITTED_EVENT, &event_data);
+
 	ukarch_ctx_init_entry2(&loader_args.ctx,
 			       loader_args.ctx.sp,
 			       1, /* keep regs */

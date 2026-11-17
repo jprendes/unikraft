@@ -22,6 +22,11 @@
 
 #include <uk/pm.h>
 
+#include <uk/boot_service.h>
+
+UK_EVENT(UKBOOT_INIT_START_EVENT);
+UK_EVENT(UKBOOT_INIT_STOP_EVENT);
+
 #include "init.h"
 
 #if CONFIG_LIBUKBOOT_GRACEFUL_SHUTDOWN
@@ -192,6 +197,7 @@ int do_init(int argc, char *argv[])
 	sigset_t mask;
 	int sigfd;
 	int ret;
+	struct uk_boot_service_event_data service = { .standalone = false };
 
 	/* Block all signals */
 	sigfillset(&mask);
@@ -209,9 +215,13 @@ int do_init(int argc, char *argv[])
 		return errno;
 	}
 
+	ret = uk_raise_event(UKBOOT_INIT_START_EVENT, &service);
+	if (ret < 0)
+		UK_CRASH("cannot initialize boot service: %d\n", ret);
 	/* Spawn application process */
-	application_pid = uk_posix_process_run(init_mainlike, argc,
-					       (const char **)argv);
+	if (!service.standalone)
+		application_pid = uk_posix_process_run(init_mainlike, argc,
+						       (const char **)argv);
 
 	/* Wait for application to exit and reap reparented children */
 	while (1) {
@@ -231,7 +241,7 @@ int do_init(int argc, char *argv[])
 
 			UK_ASSERT(ret == 0 || (ret == -1 && errno == ECHILD));
 
-			if (ret == -1 && errno == ECHILD) {
+			if (ret == -1 && errno == ECHILD && !service.standalone) {
 				uk_pr_info("All children terminated. Initiating shutdown...\n");
 				goto out;
 			}
@@ -251,12 +261,14 @@ out:
 	 * Unikraft to terminate all remaining processes and shut down the
 	 * system.
 	 */
-	if (!application_returned) {
+	if (!service.standalone && !application_returned) {
 		uk_pr_debug("The application did not exit gracefully\n");
 		application_status = TERM_BY_SIGNAL_BIT | SIGKILL;
 	}
 
 	close(sigfd);
 
+	ret = uk_raise_event(UKBOOT_INIT_STOP_EVENT, &service);
+	UK_ASSERT(ret >= 0);
 	return application_status;
 }

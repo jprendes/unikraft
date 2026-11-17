@@ -40,7 +40,10 @@
  *                  re-established (listeners bound again, connections
  *                  declared dead) since they belonged to the old host.
  *
- *   /dev/hlcall    Named guest functions (anything but `step` and `resume`)
+ *   hl-command    An init-owned launcher thread handles CommandSpawn and
+ *                  CommandKill, independently of any userspace driver.
+ *
+ *   /dev/hlcall    Other named guest functions (besides the pump functions)
  *                  cannot run
  *                  on the yield thread -- a call that blocks there
  *                  could never yield the vCPU.  They are queued on this
@@ -157,7 +160,9 @@ struct hlcall_hostcall {
  */
 #define HLCALL_IOC_RESTORES _IOR('H', 4, __u64)
 
-/* Command protocol v7: kernel supervision and batched lifecycle reports. */
+/* Legacy command ioctls. Protocol v8 launches directly in the kernel;
+ * COMMAND_DRIVER returns EOPNOTSUPP so old drivers retain legacy dispatch.
+ */
 #define HLCALL_IOC_EXECUTION _IOW('H', 5, __u64)
 #define HLCALL_IOC_COMMAND_DRIVER _IOR('H', 6, __u64)
 struct hl_command_event {
@@ -191,6 +196,18 @@ struct uk_thread;
 __u64 hl_thread_execution(const struct uk_thread *thread);
 void hl_thread_set_execution(struct uk_thread *thread, __u64 execution);
 __u64 hl_execution_for_pid(int pid);
+
+#if CONFIG_HYPERLIGHT_COMMAND
+extern int hyperlight_command_only;
+int hl_command_service_init(void);
+void hl_command_service_shutdown(void);
+int hl_command_service_ready(void);
+int hl_command_submit(const char *data, __sz len, int kill);
+void hl_command_complete(int status);
+int hl_execution_begin(__u64 id);
+void hl_execution_started(int pid, int error);
+int hl_execution_kill(__u64 id);
+#endif
 
 #if CONFIG_HYPERLIGHT_STEP
 
