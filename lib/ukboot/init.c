@@ -22,6 +22,10 @@
 
 #include <uk/pm.h>
 
+#if CONFIG_HYPERLIGHT_COMMAND
+#include <hyperlight/step.h>
+#endif
+
 #include "init.h"
 
 #if CONFIG_LIBUKBOOT_GRACEFUL_SHUTDOWN
@@ -192,6 +196,7 @@ int do_init(int argc, char *argv[])
 	sigset_t mask;
 	int sigfd;
 	int ret;
+	int command_only = 0;
 
 	/* Block all signals */
 	sigfillset(&mask);
@@ -209,9 +214,16 @@ int do_init(int argc, char *argv[])
 		return errno;
 	}
 
+#if CONFIG_HYPERLIGHT_COMMAND
+	ret = hl_command_service_init();
+	if (ret < 0)
+		UK_CRASH("cannot initialize command service: %d\n", ret);
+	command_only = hyperlight_command_only;
+#endif
 	/* Spawn application process */
-	application_pid = uk_posix_process_run(init_mainlike, argc,
-					       (const char **)argv);
+	if (!command_only)
+		application_pid = uk_posix_process_run(init_mainlike, argc,
+						       (const char **)argv);
 
 	/* Wait for application to exit and reap reparented children */
 	while (1) {
@@ -231,7 +243,7 @@ int do_init(int argc, char *argv[])
 
 			UK_ASSERT(ret == 0 || (ret == -1 && errno == ECHILD));
 
-			if (ret == -1 && errno == ECHILD) {
+			if (ret == -1 && errno == ECHILD && !command_only) {
 				uk_pr_info("All children terminated. Initiating shutdown...\n");
 				goto out;
 			}
@@ -251,12 +263,15 @@ out:
 	 * Unikraft to terminate all remaining processes and shut down the
 	 * system.
 	 */
-	if (!application_returned) {
+	if (!command_only && !application_returned) {
 		uk_pr_debug("The application did not exit gracefully\n");
 		application_status = TERM_BY_SIGNAL_BIT | SIGKILL;
 	}
 
 	close(sigfd);
 
+#if CONFIG_HYPERLIGHT_COMMAND
+	hl_command_service_shutdown();
+#endif
 	return application_status;
 }

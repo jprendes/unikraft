@@ -177,6 +177,7 @@ static const char hl_step_fn_name[] = "step";
 static const char hl_async_step_fn_name[] = "step_async";
 static int hl_async_supported;
 int hyperlight_execution_enabled;
+int hyperlight_command_only;
 __u64 hyperlight_execution_active;
 
 struct hl_execution {
@@ -253,9 +254,12 @@ static int hl_command_negotiate(void)
 	__u64 version;
 	__s32 status;
 
-	if (hl_hcall_ulong("CommandDriverVersion", NULL, 0, &version) ||
-	    version != 7 ||
-	    hl_hcall_int("CommandDriverReady", NULL, 0, &status) || status)
+	if (hl_hcall_ulong("CommandServiceVersion", NULL, 0, &version) ||
+	    version != 8 ||
+	    hl_hcall_int("CommandServiceReady", NULL, 0, &status) || status)
+		return -EOPNOTSUPP;
+	if (hyperlight_command_only &&
+	    (hl_hcall_int("CommandBootReady", NULL, 0, &status) || status))
 		return -EOPNOTSUPP;
 	return 0;
 }
@@ -322,6 +326,64 @@ static void hl_execution_thread_term(struct uk_thread *thread)
 
 UK_THREAD_INIT_PRIO_FLAGS(hl_execution_thread_init, hl_execution_thread_term, 0, 0);
 
+#if CONFIG_HYPERLIGHT_COMMAND
+int hl_command_service_ready(void)
+{
+	__s32 mode = 0;
+	int error;
+
+	/* An older host has no command-only boot request. */
+	if (!hl_hcall_int("CommandBootMode", NULL, 0, &mode))
+		hyperlight_command_only = !!mode;
+	/* Hosts without command support can still use the legacy drivers. */
+	error = hl_command_negotiate();
+	if (!error)
+		hyperlight_execution_enabled = 1;
+	return hyperlight_command_only ? error : 0;
+}
+
+int hl_execution_begin(__u64 id)
+{
+	int error;
+
+	if (!id || hl_execution_find(id) ||
+	    uk_thread_current()->hyperlight_execution)
+		return -EINVAL;
+	error = hl_execution_get(id);
+	if (error)
+		return error;
+	hl_execution_find(id)->driver = uk_sys_getpid();
+	uk_thread_current()->hyperlight_execution = id;
+	return 0;
+}
+
+void hl_execution_started(int pid, int error)
+{
+	struct uk_thread *current = uk_thread_current();
+	struct hl_execution *execution =
+		hl_execution_find(current->hyperlight_execution);
+
+	UK_ASSERT(execution);
+	if (error) {
+		execution->error = error;
+		execution->events |= HL_EXEC_ERROR;
+	} else {
+		UK_ASSERT(pid > 0 && pid == execution->root);
+		execution->events |= HL_EXEC_STARTED;
+	}
+	hl_execution_thread_term(current);
+	current->hyperlight_execution = 0;
+}
+
+void hl_command_complete(int status)
+{
+	hl_start_pending = 0;
+	hl_done_pending = 1;
+	hl_call_fail_status = status;
+	hl_result_len = 0;
+}
+#endif
+
 static void hl_async_negotiate(void)
 {
 #if CONFIG_LIBDEVFS
@@ -337,6 +399,16 @@ static void hl_async_negotiate(void)
 #endif
 }
 static const char hl_resume_fn_name[] = "resume";
+
+#if CONFIG_HYPERLIGHT_COMMAND
+static const char *fc_command_arg(const struct hl_pc_call *call, __sz *size)
+{
+	if (!call->np || call->params[0].type != HL_PV_HLSTRING)
+		return NULL;
+	*size = call->params[0].str.len;
+	return call->params[0].str.ptr;
+}
+#endif
 
 /* ── Pump state ──────────────────────────────────────────────────── */
 
@@ -686,6 +758,19 @@ static void hl_async_cancel_execution(__u64 id)
 	}
 	current->hyperlight_execution = previous;
 }
+
+#if CONFIG_HYPERLIGHT_COMMAND
+int hl_execution_kill(__u64 id)
+{
+	struct hl_execution *execution = hl_execution_find(id);
+
+	if (!execution)
+		return 0;
+	execution->stopping = 1;
+	hl_async_cancel_execution(id);
+	return uk_process_kill_execution(id, execution->driver);
+}
+#endif
 
 void hl_execution_close(__u64 id, unsigned int stream)
 {
@@ -1151,11 +1236,10 @@ static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
 		uk_thread_current()->hyperlight_execution = *(__u64 *)arg;
 		return 0;
 	case HLCALL_IOC_COMMAND_DRIVER: {
-		if (hl_command_negotiate())
-			return EOPNOTSUPP;
-		hyperlight_execution_enabled = 1;
-		*(__u64 *)arg = 7;
-		return 0;
+		/* Old exec drivers can still serve legacy calls, but no longer
+		 * own command dispatch or negotiate its kernel-owned protocol.
+		 */
+		return EOPNOTSUPP;
 	}
 	case HLCALL_IOC_MAXLEN:
 		*(__u64 *)arg = hl_call_cap;
@@ -1424,7 +1508,7 @@ static void hl_resume(void)
 
 	hl_async_negotiate();
 	if (hyperlight_execution_enabled && hl_command_negotiate())
-		UK_CRASH("incompatible restored command driver\n");
+		UK_CRASH("incompatible restored command service\n");
 	hyperlight_console_resume();
 	hl_restores++;
 #if CONFIG_LIBUKRANDOM
@@ -1536,6 +1620,20 @@ void hyperlight_step_pump(const __u8 *fc, __u64 fc_len,
 #endif
 	} else if (hl_pc_name_is(call, hl_resume_fn_name))
 		hl_resume();
+#if CONFIG_HYPERLIGHT_COMMAND
+	else if (hl_pc_name_is(call, "CommandSpawn") ||
+		 hl_pc_name_is(call, "CommandKill")) {
+		__sz len = 0;
+		const char *data = fc_command_arg(call, &len);
+		int error = hl_command_submit(data, len,
+					     hl_pc_name_is(call, "CommandKill"));
+
+		if (error)
+			hl_command_complete(error);
+		else
+			hl_start_pending = 1;
+	}
+#endif
 	else if (!hl_pc_name_is(call, hl_step_fn_name))
 		hl_route_call(fc, fc_len, call);
 

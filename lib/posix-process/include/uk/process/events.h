@@ -181,6 +181,10 @@ struct posix_process_execve_event_data {
 	pid_t tid;
 };
 
+/* POSIX_PROCESS_EXECVE_COMMITTED_EVENT uses the same data after a successful
+ * execve has committed its image. Handlers must not fail or block.
+ */
+
 /**
  * POSIX_PROCESS_EXECVE_EVENT handler function
  *
