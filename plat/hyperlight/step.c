@@ -255,7 +255,7 @@ static int hl_command_negotiate(void)
 	__s32 status;
 
 	if (hl_hcall_ulong("CommandServiceVersion", NULL, 0, &version) ||
-	    version != 8 ||
+	    version != 11 ||
 	    hl_hcall_int("CommandServiceReady", NULL, 0, &status) || status)
 		return -EOPNOTSUPP;
 	if (hyperlight_command_only &&
@@ -1034,14 +1034,98 @@ static int hl_async_deliver(const __u8 *buf, __u64 len)
 	return 0;
 }
 
-/* The decoded Postcard call carries one contiguous completion batch. */
-static int hl_async_step(const struct hl_pc_call *call)
+/* The decoded Postcard call must carry one contiguous byte parameter. */
+static int fc_bytes_arg(const struct hl_pc_call *call,
+			const __u8 **data, __u64 *data_len)
 {
 	if (call->np != 1 || call->params[0].type != HL_PV_HLVECBYTES)
 		return -1;
-	return hl_async_deliver(call->params[0].vec.ptr,
-				call->params[0].vec.len);
+	*data = call->params[0].vec.ptr;
+	*data_len = call->params[0].vec.len;
+	return 0;
 }
+
+static int hl_async_step(const struct hl_pc_call *call)
+{
+	const __u8 *data;
+	__u64 size;
+
+	if (fc_bytes_arg(call, &data, &size))
+		return -1;
+	return hl_async_deliver(data, size);
+}
+
+#if CONFIG_LIBPOSIX_FDTAB
+/* Retained data replies use the ordinary waiter's output buffer. Unlike normal
+ * delivery, checkpointing spans executions, accepts replay, and cannot invoke
+ * resource callbacks. Threads are made runnable but never scheduled here.
+ */
+static int hl_async_checkpoint(const __u8 *buf, __u64 len, int commit)
+{
+	__u64 pos = 8, previous = 0;
+	__u32 count;
+
+	if (len < 8 || hl_async_u32(buf) != 1)
+		return -EPROTO;
+	count = hl_async_u32(buf + 4);
+	if (count > (len - 8) / 13)
+		return -EINVAL;
+	for (__u32 i = 0; i < count; i++) {
+		struct hl_async_wait *w;
+		__u64 id;
+		__u32 n;
+
+		if (len - pos < 12)
+			return -EPROTO;
+		id = hl_async_u64(buf + pos);
+		n = hl_async_u32(buf + pos + 8);
+		pos += 12;
+		if (id <= previous || !n || n > hl_hcall_max_payload() ||
+		    n > len - pos || buf[pos] > 1)
+			return -EPROTO;
+		previous = id;
+		for (w = hl_async_waiters; w && w->id != id; w = w->next)
+			;
+		if (!w || !w->thread || w->callback || !w->execution)
+			return -EINVAL;
+		if (w->done) {
+			if (w->error || w->len != n ||
+			    (n <= w->cap && memcmp(w->out, buf + pos, n)))
+				return -EPROTO;
+		} else if (commit) {
+			hl_async_finish(w, buf + pos, n);
+		}
+		pos += n;
+	}
+	return pos == len ? 0 : -EPROTO;
+}
+
+int hyperlight_step_checkpoint(const struct hl_pc_call *call)
+{
+	const __u8 *data;
+	__u64 size;
+	__u32 stdin_len;
+
+	if (fc_bytes_arg(call, &data, &size) ||
+	    size < 24 || size > hyperlight_dispatch_max_call() ||
+	    hl_async_u32(data) != 1 || !hyperlight_execution_enabled)
+		return -EINVAL;
+	stdin_len = hl_async_u32(data + 4);
+	if (stdin_len < 8 || stdin_len > size - 16)
+		return -EINVAL;
+	for (int commit = 0; commit < 2; commit++) {
+		int error = hl_stdio_checkpoint(data + 8, stdin_len, commit);
+
+		if (error)
+			return error;
+		error = hl_async_checkpoint(data + 8 + stdin_len,
+					    size - 8 - stdin_len, commit);
+		if (error)
+			return error;
+	}
+	return 0;
+}
+#endif
 
 /* HLCALL_IOC_HOSTCALL: HostCall(name, args) on the host, the reply into
  * the driver's buffer.  See step.h.

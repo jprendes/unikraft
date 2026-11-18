@@ -340,6 +340,17 @@ hyperlight_dispatch_inner(void)
 	 * thousands of times a second.
 	 */
 #if CONFIG_HYPERLIGHT_STEP
+	if (hl_pc_name_is(&call, "CommandCheckpoint")) {
+#if CONFIG_LIBDEVFS && CONFIG_LIBPOSIX_FDTAB
+		if (hyperlight_step_checkpoint(&call))
+			hyperlight_dispatch_push_refused_result();
+		else
+			hyperlight_dispatch_push_void_result();
+#else
+		hyperlight_dispatch_push_refused_result();
+#endif
+		return;
+	}
 	/* A named call carries the host's environment version: the kernel
 	 * fetches only when it changed.  `resume` skips it: the host gives
 	 * the first call after a restore a new version.

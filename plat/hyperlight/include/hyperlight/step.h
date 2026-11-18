@@ -160,7 +160,7 @@ struct hlcall_hostcall {
  */
 #define HLCALL_IOC_RESTORES _IOR('H', 4, __u64)
 
-/* Legacy command ioctls. Protocol v8 launches directly in the kernel;
+/* Legacy command ioctls. Protocol v11 launches directly in the kernel;
  * COMMAND_DRIVER returns EOPNOTSUPP so old drivers retain legacy dispatch.
  */
 #define HLCALL_IOC_EXECUTION _IOW('H', 5, __u64)
@@ -188,6 +188,8 @@ int hl_async_watch(__u64 id, hl_async_callback callback, void *arg,
 		   struct hl_async_wait **out);
 void hl_async_unwatch(struct hl_async_wait *wait);
 int hl_stdio_open(unsigned int stream);
+int hl_stdio_checkpoint(const __u8 *data, __u64 len, int commit);
+int hyperlight_step_checkpoint(const struct hl_pc_call *call);
 void hl_execution_close(__u64 execution, unsigned int stream);
 
 extern int hyperlight_execution_enabled;
