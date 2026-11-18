@@ -14,6 +14,7 @@
 #include <hyperlight/step.h>
 
 #define HL_STDIO_CHUNK 4096UL
+#define HL_STDIN_CAPACITY (64UL * 1024)
 static const char hl_stdio_volume[] = "hyperlight-stdio";
 
 struct hl_stdio {
@@ -25,7 +26,14 @@ struct hl_stdio {
 	unsigned int stream;
 	int error;
 	int opened;
+	struct hl_stdio *next;
+	__u64 received;
+	size_t head, queued;
+	int eof;
+	__u8 input[];
 };
+
+static struct hl_stdio *stdin_queues;
 
 static __u32 stdio_u32(const __u8 *p)
 {
@@ -60,6 +68,96 @@ static int stdio_call(struct hl_stdio *s, const char *name,
 	return 0;
 }
 
+static int stdin_sync(struct hl_stdio *s)
+{
+	struct hl_param p[3] = {
+		{ .type = HL_PV_HLULONG, .u64_val = s->execution },
+		{ .type = HL_PV_HLULONG, .u64_val = s->received },
+		{ .type = HL_PV_HLULONG, .u64_val = s->queued }
+	};
+	__u8 reply[5];
+	__sz len;
+	int error = stdio_call(s, "CommandStdin", p, 3, reply,
+			       sizeof(reply), &len);
+
+	if (error)
+		return error;
+	if (len != 2 || reply[0] || reply[1] > 1)
+		return -EPROTO;
+	s->eof = reply[1];
+	return 0;
+}
+
+static __u64 stdio_u64(const __u8 *p)
+{
+	return stdio_u32(p) | ((__u64)stdio_u32(p + 4) << 32);
+}
+
+int hl_stdio_checkpoint(const __u8 *data, __u64 len, int commit)
+{
+	__u32 records;
+
+	if (len < 8 || stdio_u32(data) != 1)
+		return -EPROTO;
+	records = stdio_u32(data + 4);
+	if (records > 1024)
+		return -EINVAL;
+	/* The caller validates both input batches before committing either. */
+	{
+		const __u8 *p = data + 8, *end = data + len;
+		__u64 previous = 0;
+
+		for (__u32 i = 0; i < records; i++) {
+			struct hl_stdio *s;
+			__u64 id, received;
+			__u32 count, eof;
+
+			if (end - p < 24)
+				return -EPROTO;
+			id = stdio_u64(p);
+			received = stdio_u64(p + 8);
+			count = stdio_u32(p + 16);
+			eof = stdio_u32(p + 20);
+			p += 24;
+			if (id <= previous || eof > 1 || count > end - p ||
+			    count > HL_STDIN_CAPACITY ||
+			    received > __U64_MAX - count)
+				return -EINVAL;
+			previous = id;
+			for (s = stdin_queues; s && s->execution != id;
+			     s = s->next)
+				;
+			if (!s)
+				return -ENOENT;
+			if (s->received == received) {
+				if (count > HL_STDIN_CAPACITY - s->queued ||
+				    (s->eof && (count || !eof)))
+					return -ENOBUFS;
+				if (commit) {
+					size_t tail = (s->head + s->queued) %
+						      HL_STDIN_CAPACITY;
+					size_t first = MIN(count,
+							HL_STDIN_CAPACITY - tail);
+
+					memcpy(s->input + tail, p, first);
+					memcpy(s->input, p + first, count - first);
+					s->queued += count;
+					s->received += count;
+					s->eof = eof;
+				}
+			} else if (s->received != received + count || s->eof != (int)eof) {
+				return -EPROTO;
+			}
+			if (commit && (s->queued || s->eof))
+				uk_file_event_set(&s->file, UKFD_POLLIN);
+			p += count;
+		}
+		if (p != end)
+			return -EPROTO;
+	}
+	return 0;
+}
+
 static void stdio_ready(void *arg, int error, const __u8 *reply, __u64 len)
 {
 	struct hl_stdio *s = arg;
@@ -85,6 +183,8 @@ static uk_pollevent stdio_poll(const struct uk_file *f, uk_pollevent mask)
 
 	if (s->error)
 		return mask & (EPOLLERR | EPOLLHUP);
+	if (!s->stream && (s->queued || s->eof))
+		return mask & (UKFD_POLLIN | (s->eof ? EPOLLHUP : 0));
 	if (s->wait)
 		return 0;
 	error = stdio_call(s, "CommandPoll", &p, 1, reply, sizeof(reply), &len);
@@ -121,6 +221,25 @@ static ssize_t stdio_read(const struct uk_file *f, const struct iovec *iov,
 		return 0;
 	if (s->error)
 		return s->error == ECANCELED ? 0 : -s->error;
+	if (s->queued) {
+		size_t first, copied;
+
+		count = MIN(count, s->queued);
+		first = MIN(count, HL_STDIN_CAPACITY - s->head);
+		copied = uk_iov_scatter(iov, iovcnt,
+				       (const char *)s->input + s->head,
+				       first, &index, &pos);
+		copied += uk_iov_scatter(iov, iovcnt, (const char *)s->input,
+					count - first, &index, &pos);
+		s->head = (s->head + copied) % HL_STDIN_CAPACITY;
+		s->queued -= copied;
+		error = stdin_sync(s);
+		if (error)
+			s->error = -error;
+		return copied;
+	}
+	if (s->eof)
+		return 0;
 	error = stdio_call(s, "CommandRead", &p, 1, reply, sizeof(reply), &len);
 	if (error)
 		return error;
@@ -187,6 +306,14 @@ static void stdio_release(const struct uk_file *f, int what)
 	struct hl_stdio *s = f->node;
 
 	if (what & UK_FILE_RELEASE_RES) {
+		if (!s->stream && s->opened) {
+			struct hl_stdio **link = &stdin_queues;
+
+			while (*link && *link != s)
+				link = &(*link)->next;
+			UK_ASSERT(*link == s);
+			*link = s->next;
+		}
 		if (s->wait)
 			hl_async_unwatch(s->wait);
 		if (s->opened)
@@ -198,9 +325,17 @@ static void stdio_release(const struct uk_file *f, int what)
 
 int hl_stdio_open(unsigned int stream)
 {
-	struct hl_stdio *s = uk_calloc(uk_alloc_get_default(), 1, sizeof(*s));
+	struct hl_stdio *s;
 	int fd;
 
+	if (!stream)
+		for (s = stdin_queues; s; s = s->next)
+			if (s->execution ==
+			    hl_thread_execution(uk_thread_current()))
+				return uk_fdtab_open(&s->file, O_RDONLY |
+					O_CLOEXEC | UKFD_O_NOSEEK);
+	s = uk_calloc(uk_alloc_get_default(), 1,
+		     sizeof(*s) + (stream ? 0 : HL_STDIN_CAPACITY));
 	if (!s)
 		return -ENOMEM;
 	s->stream = stream;
@@ -215,8 +350,13 @@ int hl_stdio_open(unsigned int stream)
 	};
 	fd = uk_fdtab_open(&s->file, (stream ? O_WRONLY : O_RDONLY) |
 				   O_CLOEXEC | UKFD_O_NOSEEK);
-	if (fd >= 0)
+	if (fd >= 0) {
 		s->opened = 1;
+		if (!stream) {
+			s->next = stdin_queues;
+			stdin_queues = s;
+		}
+	}
 	uk_file_release(&s->file);
 	return fd;
 }
