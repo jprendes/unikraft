@@ -9,14 +9,14 @@
  *
  * Allows the guest to call functions registered on the host side.
  * Communication uses the G2H virtqueue (transport.h) with Hyperlight's
- * FlatBuffer-based protocol:
+ * Postcard protocol:
  *
- *   1. Guest encodes a FunctionCall FlatBuffer, followed by the bytes of
+ *   1. Guest encodes a Postcard FunctionCall, followed by the bytes of
  *      any VecBytes parameter, into the request buffer.
  *   2. Guest publishes the request with a writable reply buffer in one
  *      chain and writes to port 109 (VirtqNotify) → VM exit.
  *   3. Host reads the request, dispatches the call, and writes the
- *      result (FunctionCallResult FlatBuffer, then any VecBytes bytes)
+ *      result (Postcard FunctionCallResult, then any VecBytes bytes)
  *      to the reply buffer.
  *   4. Guest resumes and decodes the reply.
  */
@@ -47,7 +47,7 @@ int hl_hcall_ready(void);
  * Largest payload one host call can carry, in either direction: a string
  * or vecbytes parameter on the way out, a string or vecbytes result on the
  * way back.  Derived from the G2H pool size the host chose, less a
- * reserve for the FlatBuffer framing and the other parameters, so a
+ * reserve for the control framing and the other parameters, so a
  * transfer of this size always fits.  A result can be up to the reserve
  * larger: hluk caps its data transfers at this same figure (fs_*,
  * net_recvfrom, HostCall), so a buffer of this size holds them; a
@@ -198,7 +198,7 @@ __ssz hl_call_host_write(const char *buf, __sz len);
  */
 __ssz hl_call_host_write_err(const char *buf, __sz len);
 
-/* GuestLogData levels (guest_log_level.fbs LogLevel) */
+/* GuestLogData levels (hyperlight-common guest_log_level.rs). */
 #define HL_LOG_TRACE		0
 #define HL_LOG_DEBUG		1
 #define HL_LOG_INFORMATION	2
@@ -226,7 +226,7 @@ int hl_hcall_log(__u8 level, const char *source, const char *file,
 		 __u32 line, const char *msg, __sz len);
 
 /*
- * FlatBuffer ReturnType constants (from function_types.fbs).
+ * Postcard ReturnType tags (hyperlight-common function_types.rs).
  * Used as expected_return_type in FunctionCall.
  */
 #define HL_RT_INT	0
@@ -239,29 +239,7 @@ int hl_hcall_log(__u8 level, const char *source, const char *file,
 #define HL_RT_BOOL	7
 #define HL_RT_VOID	8
 
-/*
- * FlatBuffer FunctionCallType constants.
- */
-#define HL_FCT_GUEST	1
-#define HL_FCT_HOST	2
-
-/*
- * FlatBuffer ReturnValue union discriminants.
- */
-#define HL_RV_NONE	0
-#define HL_RV_HLINT	1
-#define HL_RV_HLUINT	2
-#define HL_RV_HLLONG	3
-#define HL_RV_HLULONG	4
-#define HL_RV_HLFLOAT	5
-#define HL_RV_HLDOUBLE	6
-#define HL_RV_HLSTRING	7
-#define HL_RV_HLBOOL	8
-#define HL_RV_HLVOID	9
-
-/*
- * FlatBuffer ParameterValue union discriminants.
- */
+/* Kernel parameter identifiers, translated to Postcard WireValue tags. */
 #define HL_PV_HLINT	1
 #define HL_PV_HLUINT	2
 #define HL_PV_HLLONG	3
@@ -270,24 +248,10 @@ int hl_hcall_log(__u8 level, const char *source, const char *file,
 #define HL_PV_HLDOUBLE	6
 #define HL_PV_HLSTRING	7
 #define HL_PV_HLBOOL	8
-/* A Vec<u8> parameter, as callers name it in struct hl_param.  On the
- * wire it is an hlexternalbytes: tag 9 is reserved since Hyperlight 0.18.
- */
+/* A contiguous external byte value. */
 #define HL_PV_HLVECBYTES 9
-#define HL_PV_HLEXTERNALBYTES 10
 
-/*
- * Additional ReturnType / ReturnValue constants not in original set.
- */
 #define HL_RT_VECBYTES		9	/* ReturnType for Vec<u8> */
-#define HL_RV_HLEXTERNALBYTES	11	/* ReturnValue discriminant for Vec<u8> */
-
-/*
- * FlatBuffer FunctionCallResultType discriminants.
- */
-#define HL_FCRT_NONE		0
-#define HL_FCRT_RETURN_VALUE	1
-#define HL_FCRT_GUEST_ERROR	2
 
 /* ── Generic host function call API ──────────────────────────────── */
 

@@ -9,7 +9,7 @@
  *
  * After the initial boot (evolve), the guest halts with the address
  * of hyperlight_dispatch_function in RAX (x0 on arm64).  The host can
- * then invoke guest functions by writing a FunctionCall FlatBuffer into
+ * then invoke guest functions by writing a Postcard FunctionCall into
  * the H2G virtqueue (transport.h), setting RIP (PC) to that address, and
  * running the vCPU.
  *
@@ -44,6 +44,7 @@
 
 #include <hyperlight/dispatch.h>
 #include <hyperlight/hcall.h>
+#include <hyperlight/postcard.h>
 #include <hyperlight/mem.h>
 #include <hyperlight/outb.h>
 #include <hyperlight/setup.h>
@@ -159,42 +160,24 @@ static int hyperlight_dispatch_env_init(struct uk_init_ctx *ictx __unused)
 }
 uk_late_initcall(hyperlight_dispatch_env_init, 0x0);
 
-/*
- * Void FunctionCallResult — pre-encoded FlatBuffer.
- * Encoded by hyperlight-common 0.16.0; the FunctionCallResult schema,
- * and hlvoid's ReturnValue tag (9), are unchanged in 0.18.0.
- */
-static const __u8 HL_VOID_RESULT[] = {
-	0x2c, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
-	0xf4, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01,
-	0x0c, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0c, 0x00,
-	0x07, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x09, 0x08, 0x00, 0x00, 0x00,
-	0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x00, 0x00,
-};
+/* Postcard WireResult::Ok(WireValue::Void). */
+static const __u8 HL_VOID_RESULT[] = { 0, 8 };
 
 /*
  * GuestError FunctionCallResult (ErrorCode::GuestError, "the kernel could
- * not receive the call") — pre-encoded FlatBuffer, by hyperlight-common
- * 0.18.0, which encodes HL_VOID_RESULT above byte for byte.  The answer
+ * not receive the call") -- Postcard Err, code, string length, UTF-8.
+ * The answer
  * to a call the guest could not take off H2G: too large for the call
  * buffer, no call buffer at all, or a message malformed or cut short
  * (see hl_transport_recv()); or one too short to be a FunctionCall.
  */
 static const __u8 HL_REFUSED_RESULT[] = {
-	0x64, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0c, 0x00,
-	0x07, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x02, 0x0c, 0x00, 0x00, 0x00,
-	0x08, 0x00, 0x14, 0x00, 0x08, 0x00, 0x04, 0x00,
-	0x08, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
-	0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x25, 0x00, 0x00, 0x00,
+	1, 15, 37,
 	0x74, 0x68, 0x65, 0x20, 0x6b, 0x65, 0x72, 0x6e,
 	0x65, 0x6c, 0x20, 0x63, 0x6f, 0x75, 0x6c, 0x64,
 	0x20, 0x6e, 0x6f, 0x74, 0x20, 0x72, 0x65, 0x63,
 	0x65, 0x69, 0x76, 0x65, 0x20, 0x74, 0x68, 0x65,
-	0x20, 0x63, 0x61, 0x6c, 0x6c, 0x00, 0x00, 0x00,
+	0x20, 0x63, 0x61, 0x6c, 0x6c,
 };
 
 /* ── Call size ─────────────────────────────────────────────────── */
@@ -254,7 +237,7 @@ static void hyperlight_dispatch_push_refused_result(void)
 }
 
 /*
- * Buffer for the FunctionCall FlatBuffer.
+ * Buffer for the Postcard FunctionCall and external values.
  *
  * The message is copied out of the H2G buffers, which go straight back
  * to the host.  Allocated at boot, at the largest call H2G can carry
@@ -283,6 +266,8 @@ hyperlight_dispatch_inner(void)
 	__s64 fc_len;
 	__u8 kind;
 	__u32 cid;
+	__u64 control_len;
+	struct hl_pc_call call;
 
 	/* Taken off H2G even without a buffer to copy it to, so the next
 	 * entry finds its own message; answered whenever its ID is known,
@@ -290,7 +275,7 @@ hyperlight_dispatch_inner(void)
 	 */
 	fc_len = hl_transport_recv(fc_buf,
 				   fc_buf ? hyperlight_dispatch_max_call() : 0,
-				   &kind, &cid);
+				   &kind, &cid, &control_len);
 	if (kind == HL_MSG_REQUEST)
 		g_call_cid = cid;
 
@@ -340,8 +325,7 @@ hyperlight_dispatch_inner(void)
 		uk_pr_err("dispatch: unexpected message kind %u\n", kind);
 		return;
 	}
-	if (unlikely(fc_len < HL_FC_MIN_LEN)) {
-		/* Too short for a FunctionCall's size prefix and root. */
+	if (unlikely(hl_pc_decode_call(fc_buf, fc_len, control_len, &call) < 0)) {
 		uk_pr_err("dispatch: call %u is malformed (%ld bytes)\n",
 			  cid, (long)fc_len);
 		hyperlight_dispatch_push_refused_result();
@@ -360,12 +344,11 @@ hyperlight_dispatch_inner(void)
 	 * fetches only when it changed.  `resume` skips it: the host gives
 	 * the first call after a restore a new version.
 	 */
-	if (!hyperlight_step_fc_is_pump(fc_buf, fc_len) &&
-	    !hyperlight_step_fc_is_resume(fc_buf, fc_len))
+	if (!hl_pc_name_is(&call, "step") && !hl_pc_name_is(&call, "resume"))
 		hyperlight_dispatch_apply_host_env_version(
-			hyperlight_step_fc_env_version(fc_buf, fc_len));
+			hl_pc_env_version(&call));
 
-	hyperlight_step_pump(fc_buf, fc_len);
+	hyperlight_step_pump(fc_buf, fc_len, &call);
 #else /* !CONFIG_HYPERLIGHT_STEP */
 	hyperlight_dispatch_apply_host_env();
 	/* No scheduler, so nothing can serve a guest function: the workload

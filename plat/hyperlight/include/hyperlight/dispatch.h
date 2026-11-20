@@ -8,7 +8,7 @@
  * Hyperlight guest dispatch API.
  *
  * After evolve, the host can invoke guest functions by writing a
- * FunctionCall FlatBuffer into the H2G virtqueue and setting RIP to
+ * Postcard FunctionCall into the H2G virtqueue and setting RIP to
  * hyperlight_dispatch_function.  The dispatch handler takes the call,
  * hands it to the cooperative step pump (step.h), queues a void result
  * on G2H, and halts via port 108.
@@ -18,11 +18,6 @@
 #define __HYPERLIGHT_DISPATCH_H__
 
 #include <uk/arch/types.h>
-
-/* The least a size-prefixed FunctionCall takes: its size prefix and the
- * offset of its root table.
- */
-#define HL_FC_MIN_LEN 8
 
 /**
  * Initialise the dispatch subsystem.

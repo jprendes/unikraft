@@ -18,9 +18,9 @@
  *
  * The host publishes the queue geometry at the top of scratch; the ring
  * and pool addresses follow from it (hyperlight-common layout.rs,
- * TransportArena).  Every message starts with a 12-byte header (kind,
- * correlation ID, payload length), followed by a size-prefixed
- * FlatBuffer and the bytes of any VecBytes value, in parameter order.
+ * TransportArena). Every message starts with a 16-byte header (kind,
+ * correlation ID, payload length, control length), followed by Postcard
+ * control data and the bytes of any VecBytes value, in parameter order.
  *
  * Unlike a Rust guest, this one keeps no transport buffer past the call
  * that used it: an H2G message is copied out and its buffers reposted at
@@ -45,7 +45,7 @@
 #define HL_MSG_LOG			0x06
 #define HL_MSG_SNAPSHOT_CHECKPOINT	0x07
 
-#define HL_MSG_HEADER_SIZE		12
+#define HL_MSG_HEADER_SIZE		16
 
 /**
  * Locate the rings and pools from the geometry the host published at the
@@ -76,7 +76,7 @@ int hl_transport_ready(void);
 void hl_transport_abandon(void);
 
 /**
- * Where a host call's payload goes: the FunctionCall FlatBuffer, then
+ * Where a host call's payload goes: the Postcard FunctionCall, then
  * any external bytes.  The buffer is shared with the host and reused by
  * every call; it holds hl_transport_payload_cap() bytes.  NULL when no
  * host call can be made: unless hl_transport_ready(), or while a guest
@@ -103,14 +103,16 @@ __u64 hl_transport_payload_cap(void);
  * the ring is unusable after.
  *
  * @param payload_len  Bytes of the request payload.
+ * @param control_len  Bytes of Postcard control data before external values.
  * @param reply        Receives the reply payload (a FunctionCallResult
- *                     FlatBuffer, then any external bytes); valid until
+ *                     Postcard value, then any external bytes); valid until
  *                     the next transport call.
  * @param reply_len    Receives its length.
+ * @param reply_control Receives the reply's control length.
  * @return 0 on success, HL_TRANSPORT_NOT_SENT or HL_TRANSPORT_BAD_REPLY.
  */
-int hl_transport_call(__u64 payload_len,
-		      const __u8 **reply, __u64 *reply_len);
+int hl_transport_call(__u64 payload_len, __u64 control_len,
+		      const __u8 **reply, __u64 *reply_len, __u64 *reply_control);
 
 /**
  * Send the GuestLogData in hl_transport_request_buf() as a Log message,
@@ -140,9 +142,11 @@ __u64 hl_transport_max_recv(void);
  * @param kind  Receives the message kind (HL_MSG_*), 0 if unknown.
  * @param cid   Receives the correlation ID to answer a request with, 0
  *              if unknown; set even when the payload is refused.
+ * @param control_len Receives the number of control bytes before external data.
  * @return The payload length, or -1 if it was refused or lost.
  */
-__s64 hl_transport_recv(__u8 *buf, __u64 cap, __u8 *kind, __u32 *cid);
+__s64 hl_transport_recv(__u8 *buf, __u64 cap, __u8 *kind, __u32 *cid,
+		       __u64 *control_len);
 
 /**
  * Queue the result of guest function call @a cid on G2H.  The host reads

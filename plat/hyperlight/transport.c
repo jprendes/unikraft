@@ -72,6 +72,7 @@ struct msg_header {
 	__u8 reserved[3];
 	__u32 cid;
 	__u32 payload_len;
+	__u32 control_len;
 };
 
 UK_CTASSERT(sizeof(struct msg_header) == HL_MSG_HEADER_SIZE);
@@ -427,12 +428,14 @@ static int g2h_begin(void)
 	return id;
 }
 
-static void put_header(__u8 *at, __u8 kind, __u32 cid, __u32 payload_len)
+static void put_header(__u8 *at, __u8 kind, __u32 cid, __u32 payload_len,
+		       __u32 control_len)
 {
 	struct msg_header h = {
 		.kind = kind,
 		.cid = cid,
 		.payload_len = payload_len,
+		.control_len = control_len,
 	};
 
 	memcpy(at, &h, sizeof(h));
@@ -450,8 +453,8 @@ __u64 hl_transport_payload_cap(void)
 	return transport_ready ? g2h_half - HL_MSG_HEADER_SIZE : 0;
 }
 
-int hl_transport_call(__u64 payload_len,
-		      const __u8 **reply, __u64 *reply_len)
+int hl_transport_call(__u64 payload_len, __u64 control_len,
+		      const __u8 **reply, __u64 *reply_len, __u64 *reply_control)
 {
 	struct msg_header h;
 	__u64 addr[2] = { (__u64)g2h_req, (__u64)g2h_reply };
@@ -462,7 +465,8 @@ int hl_transport_call(__u64 payload_len,
 	int id;
 
 	if (unlikely(!hl_transport_ready() ||
-		     payload_len > g2h_half - HL_MSG_HEADER_SIZE))
+		     payload_len > g2h_half - HL_MSG_HEADER_SIZE ||
+		     control_len > payload_len))
 		return HL_TRANSPORT_NOT_SENT;
 	id = g2h_begin();
 	if (id < 0)
@@ -473,7 +477,7 @@ int hl_transport_call(__u64 payload_len,
 	if (!next_cid)
 		next_cid = 1;
 
-	put_header(g2h_req, HL_MSG_REQUEST, cid, payload_len);
+	put_header(g2h_req, HL_MSG_REQUEST, cid, payload_len, control_len);
 	if (vq_submit(&g2h, id, addr, len, flags, 2) < 0)
 		return HL_TRANSPORT_NOT_SENT;
 
@@ -489,11 +493,14 @@ int hl_transport_call(__u64 payload_len,
 	memcpy(&h, g2h_reply, sizeof(h));
 	if (written < HL_MSG_HEADER_SIZE || written > g2h_half ||
 	    h.kind != HL_MSG_RESPONSE ||
-	    h.cid != cid || h.payload_len > written - HL_MSG_HEADER_SIZE)
+	    h.cid != cid || h.payload_len != written - HL_MSG_HEADER_SIZE ||
+	    h.control_len > h.payload_len ||
+	    h.reserved[0] || h.reserved[1] || h.reserved[2])
 		return HL_TRANSPORT_BAD_REPLY;
 
 	*reply = g2h_reply + HL_MSG_HEADER_SIZE;
 	*reply_len = h.payload_len;
+	*reply_control = h.control_len;
 	return 0;
 }
 
@@ -514,7 +521,7 @@ int hl_transport_log(__u64 payload_len)
 		return HL_TRANSPORT_NOT_SENT;
 
 	/* A log carries no correlation ID: nothing answers it. */
-	put_header(g2h_req, HL_MSG_LOG, 0, payload_len);
+	put_header(g2h_req, HL_MSG_LOG, 0, payload_len, payload_len);
 	if (vq_submit(&g2h, id, &addr, &len, &flags, 1) < 0)
 		return HL_TRANSPORT_NOT_SENT;
 
@@ -541,7 +548,7 @@ int hl_transport_respond(__u32 cid, const __u8 *payload, __u64 len)
 	if (id < 0)
 		return -1;
 
-	put_header(g2h_req, HL_MSG_RESPONSE, cid, len);
+	put_header(g2h_req, HL_MSG_RESPONSE, cid, len, len);
 	memcpy(g2h_req + HL_MSG_HEADER_SIZE, payload, len);
 	if (vq_submit(&g2h, id, &addr, &dlen, &flags, 1) < 0)
 		return -1;
@@ -606,7 +613,8 @@ static void h2g_drain(void)
 		h2g_repost(slot);
 }
 
-__s64 hl_transport_recv(__u8 *buf, __u64 cap, __u8 *kind, __u32 *cid)
+__s64 hl_transport_recv(__u8 *buf, __u64 cap, __u8 *kind, __u32 *cid,
+		       __u64 *control_len)
 {
 	struct msg_header h;
 	__u64 got = 0, off = HL_MSG_HEADER_SIZE;
@@ -617,6 +625,7 @@ __s64 hl_transport_recv(__u8 *buf, __u64 cap, __u8 *kind, __u32 *cid)
 
 	*kind = 0;
 	*cid = 0;
+	*control_len = 0;
 	if (unlikely(!transport_ready))
 		return -1;
 
@@ -636,12 +645,15 @@ __s64 hl_transport_recv(__u8 *buf, __u64 cap, __u8 *kind, __u32 *cid)
 	memcpy(&h, b, sizeof(h));
 	*kind = h.kind;
 	*cid = h.cid;
+	*control_len = h.control_len;
 
 	/* A message that does not fit, or is malformed, is refused; it is
 	 * taken off the ring whole all the same (h2g_drain()).
 	 */
 	refuse = h.payload_len > cap ||
-		 len - HL_MSG_HEADER_SIZE > h.payload_len;
+		 len - HL_MSG_HEADER_SIZE > h.payload_len ||
+		 h.control_len > h.payload_len ||
+		 h.reserved[0] || h.reserved[1] || h.reserved[2];
 
 	/* Copy out, then hand each buffer straight back to the host. */
 	for (;;) {

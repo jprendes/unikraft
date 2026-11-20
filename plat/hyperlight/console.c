@@ -15,7 +15,7 @@
  *      not send.
  *
  *   2. HostWrite (host function call) — one VM exit per host call's
- *      worth of the buffer.  Uses the FlatBuffer-based hcall protocol
+ *      worth of the buffer. Uses the Postcard hcall protocol
  *      over the G2H virtqueue.  Requires hl_hcall_init() to have been
  *      called.  Standard error goes through HostWriteErr, the same
  *      call under another name, so the host keeps them apart.  A host

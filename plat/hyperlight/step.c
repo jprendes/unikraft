@@ -168,134 +168,6 @@ static void hl_emit_yield(__u64 ns)
 static const char hl_step_fn_name[] = "step";
 static const char hl_resume_fn_name[] = "resume";
 
-/* ── FlatBuffer helpers (FunctionCall.function_name) ─────────────── */
-
-static inline __u32 fb_u32(const __u8 *b, __u64 o)
-{
-	return b[o] | ((__u32)b[o + 1] << 8) |
-	       ((__u32)b[o + 2] << 16) | ((__u32)b[o + 3] << 24);
-}
-
-static inline __u16 fb_u16(const __u8 *b, __u64 o)
-{
-	return b[o] | ((__u16)b[o + 1] << 8);
-}
-
-/* True if the size-prefixed FunctionCall in @b is named @name. */
-static int fc_name_is(const __u8 *b, __u64 len, const char *name)
-{
-	__u64 root, vt, p, nlen;
-	__u16 vsize, off;
-
-	if (!b || len < HL_FC_MIN_LEN)
-		return 0;
-	root = 4 + fb_u32(b, 4);
-	if (root + 4 > len)
-		return 0;
-	/* vtable is at root - soffset; function_name is vtable slot 4. */
-	vt = root - (__s32)fb_u32(b, root);
-	if (vt > len || len - vt < 6)	/* vt may have wrapped */
-		return 0;
-	vsize = fb_u16(b, vt);
-	if (vsize < 6)
-		return 0;
-	off = fb_u16(b, vt + 4);
-	if (!off)
-		return 0;
-	p = root + off;
-	if (p + 4 > len)
-		return 0;
-	p += fb_u32(b, p);
-	if (p + 4 > len)
-		return 0;
-	nlen = fb_u32(b, p);
-	if (p + 4 + nlen > len || nlen != strlen(name))
-		return 0;
-
-	return !memcmp(b + p + 4, name, nlen);
-}
-
-/* Where field @vtoff (a vtable byte offset: 4 is the first field) of the
- * table at @tbl lies in @b, or 0 if absent or out of bounds.
- */
-static __u64 fb_field_at(const __u8 *b, __u64 len, __u64 tbl, __u16 vtoff)
-{
-	__u64 vt;
-	__u16 vsize, off;
-
-	if (tbl + 4 > len)
-		return 0;
-	vt = tbl - (__s32)fb_u32(b, tbl);
-	if (vt > len || len - vt < 4)	/* vt may have wrapped */
-		return 0;
-	vsize = fb_u16(b, vt);
-	if (vtoff + 2 > vsize || vt + vtoff + 2 > len)
-		return 0;
-	off = fb_u16(b, vt + vtoff);
-	return off && tbl + off < len ? tbl + off : 0;
-}
-
-/* The table a uoffset at @pos points to, or 0. */
-static __u64 fb_deref(const __u8 *b, __u64 len, __u64 pos)
-{
-	__u64 t;
-
-	if (!pos || pos + 4 > len)
-		return 0;
-	t = pos + fb_u32(b, pos);
-	return t + 4 <= len ? t : 0;
-}
-
-/* The last parameter of the size-prefixed FunctionCall @b when it is a
- * u64 (hlulong): the host's environment version, which it appends to
- * Exec, GuestExec and Call.  0 when there is none.
- */
-static __u64 fc_env_version(const __u8 *b, __u64 len)
-{
-	__u64 root, params, count, elem, value, field, v = 0;
-	__u64 tf;
-
-	if (!b || len < HL_FC_MIN_LEN)
-		return 0;
-	root = 4 + fb_u32(b, 4);
-	/* FunctionCall.parameters, then its last Parameter. */
-	params = fb_deref(b, len, fb_field_at(b, len, root, 6));
-	if (!params)
-		return 0;
-	count = fb_u32(b, params);
-	if (!count || params + 4 + 4 * count > len)
-		return 0;
-	elem = fb_deref(b, len, params + 4 + 4 * (count - 1));
-	if (!elem)
-		return 0;
-	/* Parameter.value_type 4 is hlulong; Parameter.value its table. */
-	tf = fb_field_at(b, len, elem, 4);
-	if (!tf || b[tf] != 4)
-		return 0;
-	value = fb_deref(b, len, fb_field_at(b, len, elem, 6));
-	if (!value)
-		return 0;
-	/* hlulong.value; absent means its default, 0. */
-	field = fb_field_at(b, len, value, 4);
-	if (field && field + 8 <= len)
-		memcpy(&v, b + field, sizeof(v));
-	return v;
-}
-
-/* The environment version the call in @fc carries (see
- * fc_env_version()); for dispatch.c, which applies the environment ahead
- * of named calls.
- */
-__u64 hyperlight_step_fc_env_version(const __u8 *fc, __u64 fc_len)
-{
-	return fc_env_version(fc, fc_len);
-}
-
-int hyperlight_step_fc_is_resume(const __u8 *fc, __u64 fc_len)
-{
-	return fc_name_is(fc, fc_len, "resume");
-}
-
 /* ── Pump state ──────────────────────────────────────────────────── */
 
 /* The yield thread: the guest thread that is "current" whenever the VM
@@ -416,7 +288,8 @@ int hyperlight_step_env(__u64 version, const char **buf, __sz *len)
  * pump) has nobody to serve the call; report it rejected at once so the
  * host fails the call instead of waiting forever for a reader.
  */
-static void hl_route_call(const __u8 *fc, __u64 fc_len)
+static void hl_route_call(const __u8 *fc, __u64 fc_len,
+			  const struct hl_pc_call *call)
 {
 	if (!hl_call_opened) {
 		uk_pr_warn("hyperlight: named call rejected, no /dev/hlcall reader\n");
@@ -438,7 +311,7 @@ static void hl_route_call(const __u8 *fc, __u64 fc_len)
 	}
 	memcpy(hl_call_buf, fc, fc_len);
 	hl_call_len = fc_len;
-	hl_call_env_version = fc_env_version(fc, fc_len);
+	hl_call_env_version = hl_pc_env_version(call);
 	if (hl_call_reader)
 		uk_thread_wake(hl_call_reader);
 }
@@ -916,11 +789,6 @@ static void hl_resume(void)
 		hl_emit("CallStarted");
 }
 
-int hyperlight_step_fc_is_pump(const __u8 *fc, __u64 fc_len)
-{
-	return fc_name_is(fc, fc_len, hl_step_fn_name);
-}
-
 int hyperlight_step_halt(__nsec wakeup_time)
 {
 	struct uk_thread *cur = uk_thread_current();
@@ -951,7 +819,8 @@ int hyperlight_step_halt(__nsec wakeup_time)
 	return 0;
 }
 
-void hyperlight_step_pump(const __u8 *fc, __u64 fc_len)
+void hyperlight_step_pump(const __u8 *fc, __u64 fc_len,
+			  const struct hl_pc_call *call)
 {
 	struct uk_sched *s = uk_sched_current();
 	struct uk_thread *idle;
@@ -976,10 +845,10 @@ void hyperlight_step_pump(const __u8 *fc, __u64 fc_len)
 		return;
 	}
 
-	if (fc_name_is(fc, fc_len, hl_resume_fn_name))
+	if (hl_pc_name_is(call, hl_resume_fn_name))
 		hl_resume();
-	else if (!hyperlight_step_fc_is_pump(fc, fc_len))
-		hl_route_call(fc, fc_len);
+	else if (!hl_pc_name_is(call, hl_step_fn_name))
+		hl_route_call(fc, fc_len, call);
 
 	hl_pump_active = 1;
 	hl_pump_idle = idle;

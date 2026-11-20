@@ -64,6 +64,7 @@
 #include <uk/arch/types.h>
 #include <uk/config.h>
 #include <uk/essentials.h>
+#include <hyperlight/postcard.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -163,12 +164,14 @@ struct hlcall_hostcall {
  * deadline to the host via the `Yield` host function and return so the
  * dispatch handler can push the void result and halt.
  *
- * @param fc      The FunctionCall FlatBuffer that entered the guest
+ * @param fc      The Postcard FunctionCall that entered the guest
  *                (a stable copy; the H2G buffers it came in are reposted
  *                at once).
  * @param fc_len  Length of @fc.
+ * @param call    Validated control fields, borrowing @fc.
  */
-void hyperlight_step_pump(const __u8 *fc, __u64 fc_len);
+void hyperlight_step_pump(const __u8 *fc, __u64 fc_len,
+			  const struct hl_pc_call *call);
 
 /**
  * Platform halt hook.
@@ -188,12 +191,6 @@ void hyperlight_step_pump(const __u8 *fc, __u64 fc_len);
 int hyperlight_step_halt(__nsec wakeup_time);
 
 /**
- * True if the size-prefixed FunctionCall @fc is the pump's own `step`
- * entry point rather than a named application call.
- */
-int hyperlight_step_fc_is_pump(const __u8 *fc, __u64 fc_len);
-
-/**
  * The host's environment for @version, fetched only when it changed (see
  * step.c).  1 if fetched, 0 if the kernel's copy stood, -1 on failure:
  * no GetEnvVars on the host or the host call failed, no memory for the
@@ -201,12 +198,6 @@ int hyperlight_step_fc_is_pump(const __u8 *fc, __u64 fc_len);
  * version that failed so, -1 again with no host call).
  */
 int hyperlight_step_env(__u64 version, const char **buf, __sz *len);
-
-/** The environment version a named call carries (0: none). */
-__u64 hyperlight_step_fc_env_version(const __u8 *fc, __u64 fc_len);
-
-/** True if @fc is the host's `resume` entry. */
-int hyperlight_step_fc_is_resume(const __u8 *fc, __u64 fc_len);
 
 /**
  * Report the call in flight's start or return on its own host call, for a
@@ -221,12 +212,6 @@ static inline void hyperlight_step_flush(void)
 }
 
 static inline int hyperlight_step_halt(__nsec wakeup_time __unused)
-{
-	return 0;
-}
-
-static inline int hyperlight_step_fc_is_pump(const __u8 *fc __unused,
-					     __u64 fc_len __unused)
 {
 	return 0;
 }
