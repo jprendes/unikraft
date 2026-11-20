@@ -42,7 +42,6 @@
 #include <hyperlight/console.h>
 #include <hyperlight/dispatch.h>
 #include <hyperlight/hcall.h>
-#include <hyperlight/peb.h>	/* only for its layout assertion */
 #include <hyperlight/setup.h>
 
 /* Console init provided by console.c */
@@ -267,13 +266,6 @@ void hyperlight_entry(struct uk_lcpu *lcpu __unused,
 	/* Initialize console so uk_pr_* works */
 	_ukplat_init_console();
 	hyperlight_console_log_init(entry_args->max_log_level);
-
-	/* Nothing is read from the PEB (see hyperlight/peb.h), but every
-	 * Hyperlight host passes one: a host that passes none is not one this
-	 * kernel was built for.
-	 */
-	if (unlikely(!entry_args->peb_address))
-		UK_CRASH("PEB address is NULL\n");
 
 	/* Get bootinfo (pre-populated by linker via bootinfo.lds.S) */
 	bi = ukplat_bootinfo_get();

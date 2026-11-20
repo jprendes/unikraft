@@ -13,16 +13,14 @@
 /**
  * Entry arguments passed from the Hyperlight host.
  *
- * Hyperlight passes four values in registers at guest entry:
- *   RDI = PEB address   (Process Environment Block)
- *   RSI = random seed
- *   RDX = OS page size
- *   RCX = max log level
+ * Hyperlight passes three values in registers at guest entry:
+ *   RDI / x0 = random seed
+ *   RSI / x1 = OS page size
+ *   RDX / x2 = max log level
  *
  * entry64.S saves these into a .data struct before calling C code.
  */
 struct hyperlight_entry_args {
-	__u64 peb_address;
 	__u64 seed;
 	__u64 page_size;
 	__u64 max_log_level;

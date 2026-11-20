@@ -68,19 +68,17 @@ hl_halt_tpidr_el0:
 .balign 8
 .globl hyperlight_entry_args
 hyperlight_entry_args:
-	.quad	0	/* peb_address   (from x0) */
-	.quad	0	/* seed          (from x1) */
-	.quad	0	/* page_size     (from x2) */
-	.quad	0	/* max_log_level (from x3) */
+	.quad	0	/* seed          (from x0) */
+	.quad	0	/* page_size     (from x1) */
+	.quad	0	/* max_log_level (from x2) */
 
 /*
  * _hyperlight_entry — entry point for the Hyperlight platform.
  *
  * Hyperlight starts the guest at EL1 with the MMU on and:
- *   x0 = PEB address    (shared memory layout)
- *   x1 = random seed
- *   x2 = host page size
- *   x3 = max log level
+ *   x0 = random seed
+ *   x1 = host page size
+ *   x2 = max log level
  *   SP_EL0 = scratch stack (always writable), SPSel = 0
  *   TTBR0_EL1 = host-provided page tables, TTBR1_EL1 walks enabled
  *   VBAR_EL1 = SP_EL1 = 0, IRQ and FIQ masked
@@ -95,10 +93,9 @@ hyperlight_entry_args:
 .section .text.boot
 ENTRY(_hyperlight_entry)
 	/* ---- Save entry args in callee-saved registers --------- */
-	mov	x19, x0		/* peb_address */
-	mov	x20, x1		/* seed */
-	mov	x21, x2		/* page_size */
-	mov	x22, x3		/* max_log_level */
+	mov	x19, x0		/* seed */
+	mov	x20, x1		/* page_size */
+	mov	x21, x2		/* max_log_level */
 
 	/* ---- CPU state Hyperlight leaves to the guest ----------- */
 	/* Exceptions on the stack in use: EL1h on the scratch stack */
@@ -142,7 +139,7 @@ ENTRY(_hyperlight_entry)
 	adrp	x10, hyperlight_entry_args
 	add	x10, x10, #:lo12:hyperlight_entry_args
 	stp	x19, x20, [x10]
-	stp	x21, x22, [x10, #16]
+	str	x21, [x10, #16]
 
 	/* Switch to the boot stack and enter C */
 	mov	sp, x9

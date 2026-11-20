@@ -47,19 +47,17 @@ lcpu_boot_startup_args:
 .section .data
 .globl hyperlight_entry_args
 hyperlight_entry_args:
-	.quad	0	/* peb_address (from RDI) */
-	.quad	0	/* seed        (from RSI) */
-	.quad	0	/* page_size   (from RDX) */
-	.quad	0	/* max_log_level (from RCX) */
+	.quad	0	/* seed        (from RDI) */
+	.quad	0	/* page_size   (from RSI) */
+	.quad	0	/* max_log_level (from RDX) */
 
 /*
  * _hyperlight_entry — 64-bit entry point for the Hyperlight platform.
  *
  * Hyperlight starts the guest in 64-bit long mode with:
- *   RDI = PEB address    (shared memory layout)
- *   RSI = random seed
- *   RDX = page size
- *   RCX = max log level
+ *   RDI = random seed
+ *   RSI = page size
+ *   RDX = max log level
  *   RSP = scratch stack   (always writable)
  *   CR3 = host-provided page tables (identity-mapped)
  *   Interrupts disabled
@@ -77,10 +75,9 @@ hyperlight_entry_args:
 ENTRY(_hyperlight_entry)
 
 	/* ---- Save entry args in callee-saved registers --------- */
-	movq	%rdi, %rbx	/* peb_address */
-	movq	%rsi, %r15	/* seed */
-	movq	%rdx, %r14	/* page_size */
-	movq	%rcx, %r13	/* max_log_level */
+	movq	%rdi, %r15	/* seed */
+	movq	%rsi, %r14	/* page_size */
+	movq	%rdx, %r13	/* max_log_level */
 
 	/* ---- Check if CoW is active ----------------------------- */
 	movabs	$SCRATCH_SIZE_GVA, %rax
@@ -181,17 +178,15 @@ ENTRY(_hyperlight_entry)
 .Lcow_setup_done:
 
 	/* ---- Restore entry args -------------------------------- */
-	movq	%rbx, %rdi
-	movq	%r15, %rsi
-	movq	%r14, %rdx
-	movq	%r13, %rcx
+	movq	%r15, %rdi
+	movq	%r14, %rsi
+	movq	%r13, %rdx
 
 	/* Save to .data (triggers CoW faults — handler is ready) */
 	leaq	hyperlight_entry_args(%rip), %rax
 	movq	%rdi, 0(%rax)
 	movq	%rsi, 8(%rax)
 	movq	%rdx, 16(%rax)
-	movq	%rcx, 24(%rax)
 
 #if CONFIG_LIBUKRELOC
 	pushq	%rdi
